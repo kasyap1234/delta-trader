@@ -25,6 +25,14 @@ from data_loader import resolve_date_window
 from portfolio_engine import run_shared_donchian_portfolio
 
 
+if not hasattr(unittest.TestCase, "enterContext"):
+    def _enterContext(self, cm):
+        res = cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+        return res
+    unittest.TestCase.enterContext = _enterContext
+
+
 def bars(index, start, slope):
     prices = pd.Series([start + slope * i for i in range(len(index))], index=index)
     return pd.DataFrame(dict(open=prices, high=prices + .5, low=prices - .5, close=prices, volume=10))
@@ -291,3 +299,48 @@ class BacktestSafetyTest(unittest.TestCase):
         self.assertEqual(eval_end - eval_start, pd.Timedelta(days=14))
         self.assertEqual(eval_start - fetch_start, pd.Timedelta(days=60))
         self.assertEqual(eval_end, end)
+
+
+class ProductionReadinessAdditionsTest(unittest.TestCase):
+    def test_6h_resolution_schedule_and_prod_unlock(self):
+        with patch.dict(os.environ, {"DELTA_RESOLUTION": "6h", "DELTA_ENV": "prod", "DRY_RUN": "false", "ALLOW_PROD_ORDERS": "true"}):
+            cfg = DeltaLiveConfig()
+            self.assertEqual(cfg.resolution, "6h")
+            self.assertTrue(cfg.allow_prod_orders)
+
+        t = datetime(2026, 11, 22, 5, 30, 0, tzinfo=delta.timezone.utc)
+        self.assertEqual(delta.seconds_until_next_bar_close("6h", now=t), 1815.0)
+
+    def test_authentic_upstox_expired_options_validator(self):
+        import validate_real_nifty_spreads as vns
+
+        dates = pd.date_range("2026-06-01", "2026-11-15", freq="B", tz="Asia/Kolkata")
+        spot = bars(dates, 24000, 10)
+        exp_str = str(dates[-1].date())
+        entry_str = str(dates[-6].date())
+
+        opt_idx = dates[-6:]
+        short_df = pd.DataFrame({"open": 120.0, "high": 125.0, "low": 20.0, "close": [120.0, 90.0, 60.0, 35.0, 10.0, 0.05], "volume": 1000.0, "oi": 5000.0}, index=opt_idx)
+        long_df = pd.DataFrame({"open": 40.0, "high": 45.0, "low": 5.0, "close": [40.0, 30.0, 20.0, 10.0, 2.0, 0.05], "volume": 1000.0, "oi": 5000.0}, index=opt_idx)
+
+        def fake_contracts(exp, key):
+            return [
+                {"instrument_type": "PE", "strike_price": s, "lot_size": 75, "expired_instrument_key": f"NSE_FO|{s}|{exp}"}
+                for s in range(23000, 27000, 50)
+            ]
+
+        seen = []
+        def fake_candles(ekey, to_d, from_d, interval="day"):
+            seen.append(ekey)
+            return short_df if len(seen) == 1 else long_df
+
+        with (
+            patch.object(vns, "load_upstox_expired_expiries", return_value=[exp_str]),
+            patch.object(vns, "load_upstox", return_value=spot),
+            patch.object(vns, "load_upstox_expired_option_contracts", side_effect=fake_contracts),
+            patch.object(vns, "load_upstox_expired_candles", side_effect=fake_candles),
+        ):
+            trades_df, eq, _ = vns.run_authentic_upstox_nifty_spreads(capital=2_000_000.0, cost_per_lot=75.0)
+            self.assertEqual(len(trades_df), 1)
+            self.assertGreater(trades_df.iloc[0]["net_pnl_rs"], 0)
+            self.assertEqual(trades_df.iloc[0]["exit_reason"], "TP_65PCT")

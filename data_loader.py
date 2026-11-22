@@ -334,3 +334,60 @@ def load_upstox(
     if interval in ("2h", "4h", "6h", "12h"):
         df = _resample_ohlcv(df, interval)
     return df
+
+
+# ---------------------------------------------------------------------------
+# UPSTOX V2 EXPIRED INSTRUMENTS API (Authentic Historical NSE Option Candles)
+# Requires Upstox Plus plan; covers ~6 months of expired weekly/monthly expiries.
+# ---------------------------------------------------------------------------
+UPSTOX_V2_BASE = "https://api.upstox.com/v2"
+
+
+def _upstox_headers() -> dict:
+    token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    if not token:
+        raise ValueError("UPSTOX_ACCESS_TOKEN missing in .env")
+    return {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+
+def load_upstox_expired_expiries(instrument_key: str = "NSE_INDEX|Nifty 50") -> list:
+    """Returns sorted list of available expired expiry dates (YYYY-MM-DD) from Upstox V2."""
+    url = f"{UPSTOX_V2_BASE}/expired-instruments/expiries"
+    r = requests.get(url, headers=_upstox_headers(), params={"instrument_key": instrument_key}, timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    return sorted(data)
+
+
+def load_upstox_expired_option_contracts(expiry_date: str, instrument_key: str = "NSE_INDEX|Nifty 50") -> list:
+    """Returns all expired option contracts (with expired_instrument_key, strike_price, lot_size) for an expiry."""
+    url = f"{UPSTOX_V2_BASE}/expired-instruments/option/contract"
+    params = {"instrument_key": instrument_key, "expiry_date": expiry_date}
+    r = requests.get(url, headers=_upstox_headers(), params=params, timeout=15)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def load_upstox_expired_candles(
+    expired_instrument_key: str,
+    to_date: str,
+    from_date: str,
+    interval: str = "day",
+) -> pd.DataFrame:
+    """
+    Fetches authentic historical OHLCV+OI candles for an expired NSE option contract.
+    Supported intervals: 'day', '30minute', '15minute', '5minute', '3minute', '1minute'.
+    """
+    encoded_key = quote(expired_instrument_key, safe="")
+    url = f"{UPSTOX_V2_BASE}/expired-instruments/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
+    r = requests.get(url, headers=_upstox_headers(), timeout=15)
+    r.raise_for_status()
+    candles = r.json().get("data", {}).get("candles", [])
+    if not candles:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "oi"])
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    for col in ["open", "high", "low", "close", "volume", "oi"]:
+        df[col] = df[col].astype(float)
+    df = df.set_index("timestamp")
+    return _normalize_ist_index(df)

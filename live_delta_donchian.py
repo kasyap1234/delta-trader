@@ -80,8 +80,8 @@ class DeltaExchangeClient:
         }
 
     def _request(self, method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None, auth: bool = True) -> dict:
-        if method != "GET" and (self.cfg.dry_run or self.cfg.env != "testnet"):
-            raise RuntimeError("Delta writes are restricted to testnet order mode")
+        if method != "GET" and (self.cfg.dry_run or (self.cfg.env != "testnet" and not self.cfg.allow_prod_orders)):
+            raise RuntimeError("Delta writes are restricted to testnet order mode unless ALLOW_PROD_ORDERS=true")
         query_string = "?" + urlencode(params, safe=",") if params else ""
         payload = json.dumps(body, separators=(",", ":")) if body is not None else ""
         headers = self._sign(method, path, query_string, payload) if auth else {"User-Agent": "delta-donchian-4h-bot/1.0"}
@@ -361,7 +361,7 @@ class LiveDonchianEngine:
             if side:
                 self._enter_position(sym, meta, side, mark_px, atr, expected.isoformat())
             else:
-                log.info(f"{sym} 4H | Close={closed['close']:.2f} | EMA50={closed['ema50']:.2f} | EMA200={closed['ema200']:.2f} | No signal.")
+                log.info(f"{sym} {self.cfg.resolution.upper()} | Close={closed['close']:.2f} | EMA50={closed['ema50']:.2f} | EMA200={closed['ema200']:.2f} | No signal.")
 
         self._save_state()
 
@@ -462,14 +462,21 @@ class LiveDonchianEngine:
             log.info(f"HOLD {sym} {pos['side']} | Mark={mark_px:.2f} | SL={old_sl} | Unchanged.")
 
 
-def seconds_until_next_4h_close() -> float:
-    now = datetime.now(timezone.utc)
-    next_hour = ((now.hour // 4) + 1) * 4
+def seconds_until_next_bar_close(resolution: str = "4h", now: Optional[datetime] = None) -> float:
+    """Returns seconds until the next UTC candle close (+15s buffer) for 1h/2h/4h/6h/12h/1d."""
+    now = now or datetime.now(timezone.utc)
+    step_hours = {"1h": 1, "2h": 2, "4h": 4, "6h": 6, "12h": 12, "1d": 24}.get(resolution.lower())
+    if step_hours is None:
+        raise ValueError(f"Unsupported resolution for scheduling: {resolution}")
+    next_hour = ((now.hour // step_hours) + 1) * step_hours
     if next_hour >= 24:
         next_dt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=15, microsecond=0)
     else:
         next_dt = now.replace(hour=next_hour, minute=0, second=15, microsecond=0)
     return max((next_dt - now).total_seconds(), 15.0)
+
+def seconds_until_next_4h_close() -> float:
+    return seconds_until_next_bar_close("4h")
 
 
 def main():
@@ -488,7 +495,7 @@ def main():
     with open(cfg.state_file + ".lock", "a", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         engine = LiveDonchianEngine(cfg)
-        log.info(f"Starting Delta 4H Donchian Bot | ENV={cfg.env} | DRY_RUN={cfg.dry_run} | Symbols={cfg.symbols}")
+        log.info(f"Starting Delta {cfg.resolution.upper()} Donchian Bot | ENV={cfg.env} | DRY_RUN={cfg.dry_run} | Symbols={cfg.symbols}")
         if args.once:
             engine.run_cycle()
             return
@@ -497,7 +504,7 @@ def main():
             try:
                 engine.run_cycle()
                 last_error = None
-                sleep_s = seconds_until_next_4h_close()
+                sleep_s = seconds_until_next_bar_close(cfg.resolution)
             except Exception as e:
                 log.exception("Cycle failed")
                 if str(e) != last_error:
