@@ -77,6 +77,7 @@ class DeltaLiveConfig:
     api_key: str = field(default_factory=lambda: os.getenv("DELTA_API_KEY", ""), repr=False)
     api_secret: str = field(default_factory=lambda: os.getenv("DELTA_API_SECRET", ""), repr=False)
     dry_run: bool = field(default_factory=lambda: {"true": True, "false": False}.get(os.getenv("DRY_RUN", "true").strip().lower()))
+    allow_prod_orders: bool = field(default_factory=lambda: os.getenv("ALLOW_PROD_ORDERS", "false").strip().lower() == "true")
 
     # Capital & Risk (Exact Test 2 Parameters)
     capital_usd: float = field(default_factory=lambda: float(os.getenv("DELTA_CAPITAL_USD", "1200.0")))
@@ -87,7 +88,7 @@ class DeltaLiveConfig:
 
     # Strategy Parameters (Exact Test 2 Parameters)
     symbols: List[str] = field(default_factory=lambda: ["ETHUSD", "SOLUSD"])
-    resolution: str = "4h"
+    resolution: str = field(default_factory=lambda: os.getenv("DELTA_RESOLUTION", "4h").strip().lower())
     donchian_entry_len: int = 20
     ema_fast: int = 50
     ema_slow: int = 200
@@ -109,8 +110,10 @@ class DeltaLiveConfig:
             raise ValueError("DRY_RUN must be true or false")
         if self.env not in {"prod", "testnet"}:
             raise ValueError("DELTA_ENV must be testnet or prod")
-        if not self.dry_run and self.env != "testnet":
-            raise ValueError("Production orders are disabled pending authenticated testnet validation")
+        if self.resolution not in {"1h", "2h", "4h", "6h", "12h", "1d"}:
+            raise ValueError("DELTA_RESOLUTION must be one of 1h, 2h, 4h, 6h, 12h, 1d")
+        if not self.dry_run and self.env != "testnet" and not self.allow_prod_orders:
+            raise ValueError("Production orders are disabled pending authenticated testnet validation (set ALLOW_PROD_ORDERS=true to unlock)")
         if not isfinite(self.capital_usd) or self.capital_usd <= 0:
             raise ValueError("DELTA_CAPITAL_USD must be positive and finite")
         mode = f"{self.env}-{'paper' if self.dry_run else 'orders'}"
