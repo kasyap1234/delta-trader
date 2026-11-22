@@ -26,17 +26,8 @@ class PortfolioTrade:
     exit_reason: str
 
 
-def add_donchian_features(
-    df: pd.DataFrame,
-    entry_len: int = 20,
-    warmup_bars: int = 200,
-    eval_start: Optional[pd.Timestamp] = None,
-    eval_end: Optional[pd.Timestamp] = None,
-) -> pd.DataFrame:
-    """
-    Computes EMA(50), EMA(200), ATR(14), and shifted Donchian High/Low,
-    strictly drops the first `warmup_bars` rows, and optionally slices to [eval_start, eval_end].
-    """
+def add_ema_atr_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes EMA(50), EMA(200), and ATR(14) without dropping rows for Donchian windows."""
     df = df.copy()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
@@ -51,6 +42,21 @@ def add_donchian_features(
         axis=1,
     ).max(axis=1)
     df["atr14"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    return df
+
+
+def add_donchian_features(
+    df: pd.DataFrame,
+    entry_len: int = 20,
+    warmup_bars: int = 200,
+    eval_start: Optional[pd.Timestamp] = None,
+    eval_end: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """
+    Computes EMA(50), EMA(200), ATR(14), and shifted Donchian High/Low,
+    strictly drops the first `warmup_bars` rows, and optionally slices to [eval_start, eval_end].
+    """
+    df = add_ema_atr_features(df)
     df["donchian_high"] = df["high"].rolling(entry_len).max().shift(1)
     df["donchian_low"] = df["low"].rolling(entry_len).min().shift(1)
 
@@ -94,21 +100,44 @@ def run_shared_donchian_portfolio(
             prepared[sym] = feat
 
     if not prepared:
-        return [], pd.Series(dtype=float), {"gap_stops": 0, "skipped_lot_size": 0}
+        return [], pd.Series(dtype=float), {"gap_stops": 0, "skipped_lot_size": 0, "pyramids": 0, "dd_brake_bars": 0}
 
     all_timestamps = sorted(set().union(*[df.index for df in prepared.values()]))
     if not all_timestamps:
-        return [], pd.Series(dtype=float), {"gap_stops": 0, "skipped_lot_size": 0}
+        return [], pd.Series(dtype=float), {"gap_stops": 0, "skipped_lot_size": 0, "pyramids": 0, "dd_brake_bars": 0}
 
     pos_map: Dict[str, Optional[Dict]] = {sym: None for sym in prepared}
     last_bar_map: Dict[str, pd.Series] = {}
 
+    entry_slip = cfg.slippage_pct if cfg.entry_slippage_pct is None else cfg.entry_slippage_pct
     capital = cfg.initial_capital
+    peak_equity = cfg.initial_capital
+    brake_active = False
     trades: List[PortfolioTrade] = []
     equity_records: List[Tuple[pd.Timestamp, float]] = []
-    diagnostics = {"gap_stops": 0, "skipped_lot_size": 0}
+    diagnostics = {"gap_stops": 0, "skipped_lot_size": 0, "pyramids": 0, "dd_brake_bars": 0}
 
     for ts in all_timestamps:
+        # Update drawdown brake from mark-to-market equity before evaluating new entries.
+        unr_now = 0.0
+        for sym, pos in pos_map.items():
+            if pos is not None and sym in last_bar_map:
+                cur_px = float(last_bar_map[sym]["close"])
+                unr_now += _pnl(pos["side"], pos["entry"], cur_px, pos["qty"]) * pos["fx"] - pos["funding_paid"]
+        cur_eq = capital + unr_now
+        peak_equity = max(peak_equity, cur_eq)
+        cur_dd = (peak_equity - cur_eq) / peak_equity if peak_equity > 0 else 0.0
+        if cfg.dd_brake_threshold is not None and cfg.dd_brake_threshold > 0:
+            if cur_dd >= cfg.dd_brake_threshold:
+                brake_active = True
+            elif cur_dd <= cfg.dd_brake_threshold * 0.5:
+                brake_active = False
+        if brake_active:
+            diagnostics["dd_brake_bars"] += 1
+        risk_scale = cfg.dd_brake_scale if brake_active else 1.0
+        eff_risk_pct = cfg.donchian_risk_per_trade_pct * risk_scale
+        eff_max_risk_pct = cfg.max_concurrent_risk_pct * risk_scale
+
         for sym, df in prepared.items():
             if ts not in df.index:
                 continue
@@ -131,14 +160,26 @@ def run_shared_donchian_portfolio(
                     current_open_risk_pct = sum(p["risk_pct"] for p in active_positions)
                     open_crypto_count = sum(1 for s, p in pos_map.items() if p is not None and s in crypto_set)
 
-                    can_enter_risk = (current_open_risk_pct + cfg.donchian_risk_per_trade_pct) <= (cfg.max_concurrent_risk_pct + 1e-9)
+                    can_enter_risk = (current_open_risk_pct + eff_risk_pct) <= (eff_max_risk_pct + 1e-9)
                     can_enter_crypto = (sym not in crypto_set) or (open_crypto_count < cfg.max_crypto_concurrent)
 
                     if can_enter_risk and can_enter_crypto and capital > 0:
-                        entry = float(row["open"]) * (1 + cfg.slippage_pct if side == "LONG" else 1 - cfg.slippage_pct)
+                        fx = cfg.usd_inr_rate if sym in cfg.usd_quoted_assets else 1.0
+                        entry = float(row["open"]) * (1 + entry_slip if side == "LONG" else 1 - entry_slip)
                         sl_dist = cfg.atr_trail_mult * float(prev["atr14"])
-                        target_risk_rs = capital * cfg.donchian_risk_per_trade_pct
-                        raw_qty = target_risk_rs / sl_dist
+                        target_risk_rs = capital * eff_risk_pct
+                        raw_qty = (target_risk_rs / fx) / sl_dist
+
+                        if is_long_only:
+                            allocated_spot_rs = sum(p["margin_rs"] for p in active_positions)
+                            spot_budget_rs = max(capital - allocated_spot_rs, 0.0)
+                            max_qty = (spot_budget_rs / fx) / entry
+                            raw_qty = min(raw_qty, max_qty)
+                        elif cfg.max_leverage is not None and cfg.max_leverage > 0:
+                            allocated_margin_rs = sum(p["margin_rs"] for p in active_positions)
+                            margin_budget_rs = max(capital * cfg.max_margin_utilization - allocated_margin_rs, 0.0)
+                            max_qty = ((margin_budget_rs * cfg.max_leverage) / fx) / entry
+                            raw_qty = min(raw_qty, max_qty)
 
                         if cfg.whole_lot_rounding:
                             step = cfg.lot_multipliers.get(sym, 1.0)
@@ -148,29 +189,74 @@ def run_shared_donchian_portfolio(
                                 last_bar_map[sym] = row
                                 continue
                             qty = lots * step
-                            actual_risk_rs = qty * sl_dist
                         else:
                             qty = raw_qty
-                            actual_risk_rs = target_risk_rs
 
-                        if is_long_only and (qty * entry) > capital:
-                            qty = capital / entry
-                            if cfg.whole_lot_rounding:
-                                qty = math.floor(qty)
-                            actual_risk_rs = max(qty * sl_dist, 1e-6)
+                        actual_risk_rs = max(qty * sl_dist * fx, 1e-6)
+                        notional_rs = qty * entry * fx
+                        margin_rs = notional_rs if is_long_only else (notional_rs / cfg.max_leverage if cfg.max_leverage else 0.0)
 
                         if qty > 0:
                             pos_map[sym] = {
                                 "side": side,
                                 "entry_time": ts,
                                 "entry": entry,
+                                "init_entry": entry,
+                                "init_sl_dist": sl_dist,
                                 "qty": qty,
+                                "fx": fx,
+                                "margin_rs": margin_rs,
                                 "risk_rs": actual_risk_rs,
                                 "risk_pct": actual_risk_rs / capital,
                                 "sl": entry - sl_dist if side == "LONG" else entry + sl_dist,
                                 "funding_paid": 0.0,
                                 "last_funding_ts": ts,
+                                "pyramided": False,
                             }
+
+            # Winner pyramiding: add once price moves +pyramid_trigger_r * init_sl_dist AND stop >= breakeven.
+            elif (
+                pos_map[sym] is not None
+                and cfg.pyramid_add_fraction > 0
+                and not pos_map[sym]["pyramided"]
+                and prev is not None
+                and capital > 0
+            ):
+                pos = pos_map[sym]
+                is_long = pos["side"] == "LONG"
+                is_long_only = sym in cfg.long_only_assets
+                open_px = float(row["open"])
+                move = (open_px - pos["init_entry"]) if is_long else (pos["init_entry"] - open_px)
+                be_ok = (pos["sl"] >= pos["init_entry"]) if is_long else (pos["sl"] <= pos["init_entry"])
+                if move >= cfg.pyramid_trigger_r * pos["init_sl_dist"] and be_ok:
+                    fx = pos["fx"]
+                    add_entry = open_px * (1 + entry_slip if is_long else 1 - entry_slip)
+                    raw_add = pos["qty"] * cfg.pyramid_add_fraction
+                    active_positions = [p for p in pos_map.values() if p is not None]
+                    allocated_margin_rs = sum(p["margin_rs"] for p in active_positions)
+                    if is_long_only:
+                        spot_budget_rs = max(capital - allocated_margin_rs, 0.0)
+                        raw_add = min(raw_add, (spot_budget_rs / fx) / add_entry)
+                    elif cfg.max_leverage is not None and cfg.max_leverage > 0:
+                        margin_budget_rs = max(capital * cfg.max_margin_utilization - allocated_margin_rs, 0.0)
+                        raw_add = min(raw_add, ((margin_budget_rs * cfg.max_leverage) / fx) / add_entry)
+
+                    if cfg.whole_lot_rounding:
+                        step = cfg.lot_multipliers.get(sym, 1.0)
+                        add_qty = math.floor(raw_add / step) * step
+                    else:
+                        add_qty = raw_add
+
+                    if add_qty > 0:
+                        new_qty = pos["qty"] + add_qty
+                        pos["entry"] = (pos["entry"] * pos["qty"] + add_entry * add_qty) / new_qty
+                        pos["qty"] = new_qty
+                        add_notional = add_qty * add_entry * fx
+                        pos["margin_rs"] += add_notional if is_long_only else (
+                            add_notional / cfg.max_leverage if cfg.max_leverage else 0.0
+                        )
+                        pos["pyramided"] = True
+                        diagnostics["pyramids"] += 1
 
             last_bar_map[sym] = row
 
@@ -183,7 +269,7 @@ def run_shared_donchian_portfolio(
             if sym in crypto_set:
                 periods = (ts - pos["last_funding_ts"]) // pd.Timedelta(hours=8)
                 if periods:
-                    pos["funding_paid"] += float(row["close"]) * pos["qty"] * cfg.crypto_funding_8h_pct * periods
+                    pos["funding_paid"] += float(row["close"]) * pos["qty"] * pos["fx"] * cfg.crypto_funding_8h_pct * periods
                     pos["last_funding_ts"] += periods * pd.Timedelta(hours=8)
 
             is_long = pos["side"] == "LONG"
@@ -200,7 +286,7 @@ def run_shared_donchian_portfolio(
             diagnostics["gap_stops"] += int(gap_fill)
             raw_exit = float(row["open"]) if gap_fill else stop
             exit_px = raw_exit * (1 - cfg.slippage_pct if is_long else 1 + cfg.slippage_pct)
-            gross = _pnl(pos["side"], pos["entry"], exit_px, pos["qty"])
+            gross = _pnl(pos["side"], pos["entry"], exit_px, pos["qty"]) * pos["fx"]
             net = gross - pos["funding_paid"]
             capital += net
             trades.append(PortfolioTrade(
@@ -215,7 +301,7 @@ def run_shared_donchian_portfolio(
         for sym, pos in pos_map.items():
             if pos is not None and sym in last_bar_map:
                 cur_px = float(last_bar_map[sym]["close"])
-                unrealized += _pnl(pos["side"], pos["entry"], cur_px, pos["qty"]) - pos["funding_paid"]
+                unrealized += _pnl(pos["side"], pos["entry"], cur_px, pos["qty"]) * pos["fx"] - pos["funding_paid"]
         equity_records.append((ts, capital + unrealized))
 
     # Step 3: Force-close remaining open positions at final bar
@@ -224,7 +310,7 @@ def run_shared_donchian_portfolio(
         if pos is not None and sym in last_bar_map:
             is_long = pos["side"] == "LONG"
             exit_px = float(last_bar_map[sym]["close"]) * (1 - cfg.slippage_pct if is_long else 1 + cfg.slippage_pct)
-            gross = _pnl(pos["side"], pos["entry"], exit_px, pos["qty"])
+            gross = _pnl(pos["side"], pos["entry"], exit_px, pos["qty"]) * pos["fx"]
             net = gross - pos["funding_paid"]
             capital += net
             trades.append(

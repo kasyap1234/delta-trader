@@ -1,0 +1,24 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Bot runtime state, journals, locks, and logs
+data/
+bot_state-*.json
+bot_state-*.tmp
+kotak_mcx_state.json
+kotak_mcx_state.tmp
+kotak_mcx_journal.csv
+*.lock
+trade_journal-*.csv
+*.log
+*.log.*
+
+# Python bytecode & virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/

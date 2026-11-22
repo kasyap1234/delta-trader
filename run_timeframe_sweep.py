@@ -27,15 +27,40 @@ def main():
     parser.add_argument("--days", type=int, default=730, help="Lookback days if --start not set (default: 730)")
     parser.add_argument("--start", default=None, help="Optional start date YYYY-MM-DD (e.g. 2021-01-01)")
     parser.add_argument("--end", default=None, help="Optional end date YYYY-MM-DD (e.g. 2023-12-31)")
-    parser.add_argument("--risk", type=float, default=0.01, help="Risk per Donchian trade (default: 0.01 = 1%%)")
-    parser.add_argument("--max-risk", type=float, default=0.03, help="Max concurrent open risk (default: 0.03 = 3%%)")
+    parser.add_argument("--capital", type=float, default=200_000.0, help="Initial capital (default: 200000 INR)")
+    parser.add_argument("--usd-inr", type=float, default=85.0, help="INR per USD for USD-quoted assets (default: 85.0)")
+    parser.add_argument("--usd", action="store_true", help="Simulate realistic Delta India USD account ($1200, 5-coin Config C, whole lots)")
+    parser.add_argument("--risk", type=float, default=0.02, help="Risk per Donchian trade (default: 0.02 = 2%%)")
+    parser.add_argument("--max-risk", type=float, default=0.08, help="Max concurrent open risk (default: 0.08 = 8%%)")
+    parser.add_argument("--atr-mult", type=float, default=3.5, help="ATR trailing stop multiple (default: 3.5)")
+    parser.add_argument("--slippage", type=float, default=0.0015, help="Per-side stop/exit fee+slippage rate (default: 0.0015)")
+    parser.add_argument("--entry-slippage", type=float, default=None, help="Optional maker entry cost (e.g. 0.0004)")
+    parser.add_argument("--maker", action="store_true", help="Use realistic Delta maker entry cost (0.04%% entry / 0.15%% stop)")
+    parser.add_argument("--pyramid", type=float, default=0.5, help="Winner pyramid add fraction (default: 0.5; 0 disables)")
+    parser.add_argument("--dd-brake", type=float, default=0.15, help="Drawdown brake threshold (default: 0.15; 0 disables)")
+    parser.add_argument("--spread-share", type=float, default=0.5, help="Capital weight for Engine B in combined stats (default: 0.5)")
     parser.add_argument("--crypto-source", choices=["binance", "delta"], default="binance")
-    parser.add_argument("--crypto", nargs="+", default=["ETHUSDT", "SOLUSDT"])
+    parser.add_argument("--crypto", nargs="+", default=["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"])
     parser.add_argument("--commodities", nargs="*", default=["GC=F"])
     parser.add_argument("--gold-etf", action="store_true", help="Use long-only GOLDIETF.NS instead of GC=F")
     parser.add_argument("--crypto-only", action="store_true", help="Crypto Donchian only (unlocks 2021-2023 intraday OOS)")
     parser.add_argument("--whole-lots", action="store_true", help="Round Donchian lots and exclude unverified historical option lots")
     args = parser.parse_args()
+
+    entry_slip = 0.0004 if args.maker else args.entry_slippage
+    dd_brake = args.dd_brake if args.dd_brake > 0 else None
+
+    if args.usd:
+        if args.capital == 200_000.0:
+            args.capital = 1200.0
+        args.usd_inr = 1.0
+        args.crypto_source = "delta"
+        if args.crypto == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"]:
+            args.crypto = ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "DOGEUSD"]
+        args.crypto_only = True
+        args.whole_lots = True
+        if entry_slip is None:
+            entry_slip = 0.0004
 
     donchian_rows = []
     combined_rows = []
@@ -53,8 +78,16 @@ def main():
                 days=args.days,
                 start_date=args.start,
                 end_date=args.end,
+                capital=args.capital,
+                usd_inr_rate=args.usd_inr,
                 risk=args.risk,
                 max_risk=args.max_risk,
+                atr_mult=args.atr_mult,
+                slippage=args.slippage,
+                entry_slippage=entry_slip,
+                pyramid_add=args.pyramid,
+                dd_brake=dd_brake,
+                spread_share=args.spread_share,
                 crypto_source=args.crypto_source,
                 crypto_syms=args.crypto,
                 commodities=args.commodities,

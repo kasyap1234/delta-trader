@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -191,7 +192,10 @@ def load_delta_candles(
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].set_index("timestamp")
     df = _normalize_ist_index(df)
     if resolution == "12h":
-        df = _resample_ohlcv(df, "12h")
+        # Delta's native bars and the live scheduler use UTC boundaries.
+        native = df.tz_convert("UTC")
+        complete = native["close"].resample("12h").count().eq(2)
+        df = _resample_ohlcv(native, "12h").loc[complete].tz_convert("Asia/Kolkata")
     return df
 
 
@@ -311,19 +315,24 @@ def load_upstox(
 
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     encoded_key = quote(key, safe="")
+    ist = ZoneInfo("Asia/Kolkata")
 
     frames = []
-    cur_end = fetch_end
-    while cur_end > fetch_start:
-        cur_start = max(fetch_start, cur_end - timedelta(days=chunk_days))
+    cur_end = fetch_end.astimezone(ist)
+    fetch_start_ist = fetch_start.astimezone(ist)
+    while cur_end > fetch_start_ist:
+        cur_start = max(fetch_start_ist, cur_end - timedelta(days=chunk_days))
         url = f"{UPSTOX_BASE}/historical-candle/{encoded_key}/{unit}/{step}/{cur_end.strftime('%Y-%m-%d')}/{cur_start.strftime('%Y-%m-%d')}"
         r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            candles = r.json().get("data", {}).get("candles", [])
-            if candles:
-                df_c = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-                df_c["timestamp"] = pd.to_datetime(df_c["timestamp"], utc=True)
-                frames.append(df_c[["timestamp", "open", "high", "low", "close", "volume"]])
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"Upstox authentication failed (HTTP {r.status_code}); refresh UPSTOX_ACCESS_TOKEN")
+        if not r.ok:
+            raise RuntimeError(f"Upstox historical candle error (HTTP {r.status_code}) for {symbol}: {r.text[:200]}")
+        candles = r.json().get("data", {}).get("candles", [])
+        if candles:
+            df_c = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+            df_c["timestamp"] = pd.to_datetime(df_c["timestamp"], utc=True)
+            frames.append(df_c[["timestamp", "open", "high", "low", "close", "volume"]])
         cur_end = cur_start - timedelta(days=1)
         time.sleep(0.2)
 
@@ -360,7 +369,7 @@ def load_upstox_expired_expiries(instrument_key: str = "NSE_INDEX|Nifty 50") -> 
 
 
 def load_upstox_expired_option_contracts(expiry_date: str, instrument_key: str = "NSE_INDEX|Nifty 50") -> list:
-    """Returns all expired option contracts (with expired_instrument_key, strike_price, lot_size) for an expiry."""
+    """Returns expired option contracts whose instrument_key already includes the expiry date."""
     url = f"{UPSTOX_V2_BASE}/expired-instruments/option/contract"
     params = {"instrument_key": instrument_key, "expiry_date": expiry_date}
     r = requests.get(url, headers=_upstox_headers(), params=params, timeout=15)

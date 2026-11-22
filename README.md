@@ -1,6 +1,9 @@
-# Final Hardened Portfolio Backtester & Live Trading System (v2 — Timeframe Sweep & OOS Ready)
+# Hardened Two-Broker Multi-Asset Trend System (Config C — Max Aggression)
 
-Preserves the exact **Test 2** winning risk metrics (`1%` risk/trade, `3%` max concurrent risk, max `2` crypto positions, `20`-bar Donchian + `2.5x` ATR trail, `1.5%` weekly Nifty credit spread cap) and adds **multi-timeframe plateau testing (`1h`, `2h`, `4h`, `6h`, `12h`, `1d`)** plus **custom `--start` / `--end` out-of-sample date windows**.
+Designed for **`₹2,00,000` total capital** split cleanly across two uncorrelated brokers (zero capital double-counting, whole-lot verified, `< 30%` Max DD across `2021–2026`):
+
+- **Sleeve 1 — Delta Exchange India (`$1,200 ≈ ₹1,02,000`):** `6h` Donchian(20) + EMA(50/200) + **`3.5× ATR` trail** across **`BTCUSD`, `ETHUSD`, `SOLUSD`, `BNBUSD`, `DOGEUSD`** (`2.0%` risk/trade, `8.0%` max open risk, `75%` max margin util, `5×` isolated leverage, **post-only Maker entries with IOC fallback**, **winner pyramiding `+0.5×` @ `+1.5R`**, and **`15%` drawdown brake**).
+- **Sleeve 2 — Kotak Neo (`₹98,000`):** `6h` Donchian(20) + EMA(50/200) + **`3.0× ATR` trail** across **`MCX GOLDPETAL`** (1g futures, long + short) and **`NSE SILVERBEES.NS`** (spot ETF, long-only), `2.5%` risk/trade, `8.0%` max open risk, winner pyramiding, and `15%` drawdown brake.
 
 ## Setup
 ```bash
@@ -12,53 +15,42 @@ cp .env.example .env
 
 ---
 
-## Step 1: Timeframe Plateau Check (One Command)
-Verifies that `4h` isn't a lucky spike by testing `2h`, `4h`, `6h`, `12h`, and `1d` side-by-side:
+## Step 1: Backtest the Exact `₹2,00,000` Two-Broker Portfolio
 ```bash
-python run_timeframe_sweep.py --intervals 2h 4h 6h 12h 1d
+# Recent 2 years on real Delta India 6H candles + 6H Gold/Silver whole-lot
+python run_hardened_backtest.py --two-broker --interval 6h --days 730 --maker
+
+# Full 5.9-year multi-regime check (2021-2026: 6H Crypto + 1D Gold/Silver)
+python run_hardened_backtest.py --two-broker --interval 6h --start 2021-01-01 --maker
+
+# Delta India $1,200 5-coin sleeve only
+python run_hardened_backtest.py --usd --interval 6h --days 730
 ```
 
-## Step 2: Earlier Historical Out-of-Sample Checks (2021–2023 Bear/Chop Regime)
-
-**A. Full Portfolio (ETH + SOL + Gold + Nifty Spreads) on Daily (`1d`) — 2021 to 2023 vs Full 5 Years:**
+## Step 2: Timeframe Plateau & OOS Sweep
 ```bash
-# 2021-2023 Out-of-Sample (includes 2022 crypto crash + Gold chop)
-python run_hardened_backtest.py --interval 1d --start 2021-01-01 --end 2023-12-31
+# 2021-2023 Out-of-Sample Crypto Sweep (Binance futures)
+python run_timeframe_sweep.py --crypto-only --whole-lots --capital 1200 --usd-inr 1 --maker --intervals 4h 6h 12h 1d --start 2021-01-01 --end 2023-12-31
 
-# Full 5+ Year Portfolio Run (2021-2026)
-python run_hardened_backtest.py --interval 1d --start 2021-01-01
+# Recent 2-Year Real Delta India Sweep
+python run_timeframe_sweep.py --usd --intervals 4h 6h 12h 1d
 ```
 
-**B. Crypto Donchian (`ETH` + `SOL`) on `2h`, `4h`, `6h`, `12h`, `1d` — 2021 to 2023 Out-of-Sample:**
-*(Uses Binance historical futures data, which goes back to 2020 with no 729-day intraday cap)*
+## Step 3: Live / Paper Execution
 ```bash
-python run_timeframe_sweep.py --crypto-only --intervals 2h 4h 6h 12h 1d --start 2021-01-01 --end 2023-12-31
-```
-
-## Step 3: Single Hardened Backtest (Recent 2 Years)
-```bash
-# Hardened Test 2 (4H, 1% risk, 200-bar warmup, gap-aware stops, Silver dropped)
-python run_hardened_backtest.py --interval 4h --risk 0.01
-
-# Whole-lot Donchian simulation with long-only GOLDIETF.NS
-python run_hardened_backtest.py --interval 4h --risk 0.01 --gold-etf --whole-lots
-```
-
-Warmup candles feed indicators only; they do not extend `--days`. Whole-lot runs exclude the modeled Nifty sleeve because historical listed lot sizes and executable option quotes are not available. Other backtests still model that sleeve; they are not execution or live risk validation.
-
-## Step 4: Live / Paper Execution
-```bash
-# Engine A: one public data cycle (remove --once for scheduled paper trading)
+# Sleeve 1 (Delta Exchange India): one public data cycle (remove --once for 6H daemon)
 DELTA_ENV=testnet DRY_RUN=true python live_delta_donchian.py --once
 
-# Engine B: show a Nifty candidate and verify the listed lot size
-python live_nifty_spread_advisor.py --capital 200000
+# Sleeve 2 (Kotak Neo MCX GOLDPETAL + NSE SILVERBEES.NS): generate order tickets & alerts
+python live_kotak_mcx_advisor.py --capital 98000
+# Record a confirmed Kotak Neo fill / pyramid / exit:
+python live_kotak_mcx_advisor.py --record-entry GOLDPETAL LONG 8 9600 9240
+python live_kotak_mcx_advisor.py --record-pyramid GOLDPETAL 4 10150
+python live_kotak_mcx_advisor.py --record-exit GOLDPETAL 10400 --fees-inr 60
 ```
 
-**Production order submission is disabled.** Before enabling testnet orders, use a dedicated [Delta India demo account](https://demo.delta.exchange) with no existing positions or orders, set ETHUSD/SOLUSD to 5× isolated leverage, and turn off automatic margin top-up and DETO commission. Configure testnet credentials locally and keep `DRY_RUN=true` until explicitly ready to send sandbox orders. `DELTA_ENV=prod DRY_RUN=true` can read public production market data but does not trade.
+**Production order submission is disabled.** Before enabling testnet orders, use a dedicated [Delta India demo account](https://demo.delta.exchange) with no existing positions or orders, set the account to isolated margin, set all 5 symbols (`BTCUSD`, `ETHUSD`, `SOLUSD`, `BNBUSD`, `DOGEUSD`) to `5×` isolated leverage, and turn off automatic margin top-up and DETO commission. Configure testnet credentials locally (`BOT_DATA_DIR` for persistent state/logs) and keep `DRY_RUN=true` until ready for sandbox burn-in.
 
-Run only one bot per testnet account from a persistent working directory. Preserve `bot_state-testnet-orders.json` and its order IDs across restarts; paper state is stored separately. After an unresolved order response, missing protection, or unexpected account state, inspect the actual Delta orders, positions and fills before resuming. Do not delete the state file or retry an uncertain entry just to clear the error. An emergency close halts new entries even after reconciliation. Stop-market orders can fill beyond their trigger; margin and risk sizing are estimates, not guarantees.
+Run only one bot per testnet account from a persistent `BOT_DATA_DIR`. Preserve `bot_state-testnet-orders.json` across restarts; paper state is stored separately. After an unresolved order response, missing protection, or unexpected account state, inspect actual Delta orders, positions, and fills before running `python live_delta_donchian.py --resume` once verified flat.
 
-The Nifty advisor never sends orders. It requires `UPSTOX_ACCESS_TOKEN` for market status and quotes and `--cost-per-lot` for a conservative round-trip fee/tax allowance before recommending a conditional position. `--lot-size` is an optional cross-check, not an override. The displayed risk applies only if both legs fill as a single spread at or above the quoted minimum net credit and costs are within the allowance; never leg in based on the display.
-
-Run the offline regression checks with `python -m unittest -v`.
+Run the offline regression test suite with `python -m unittest -v`.

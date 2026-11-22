@@ -1,0 +1,20 @@
+[Unit]
+Description=Delta Exchange India 6H Multi-Coin Donchian Bot (Config C)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/live_delta_donchian.py
+Restart=on-failure
+RestartSec=30
+MemoryMax=512M
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

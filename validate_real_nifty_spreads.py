@@ -1,7 +1,7 @@
 """
-AUTHENTIC UPSTOX EXPIRED OPTIONS BACKTESTER — ENGINE B (NIFTY WEEKLY CREDIT SPREADS)
+UPSTOX EXPIRED OPTIONS REPLAY — ENGINE B (NIFTY WEEKLY CREDIT SPREADS)
 
-Replaces the synthetic Black-Scholes model with 100% authentic Upstox market data:
+Uses historical Upstox market data with simulated fills:
   1. Upstox V3 Daily Spot candles for Nifty 50 (EMA20/EMA50 regime + 20-day realized vol).
   2. Upstox V2 Expired Instruments API for real expired weekly Nifty option contracts & lot sizes.
   3. Upstox V2 Expired Historical Candles for real daily OHLC option prices of both spread legs.
@@ -13,6 +13,7 @@ Requires: UPSTOX_ACCESS_TOKEN in .env (Upstox Plus plan for Expired Instruments 
 import argparse
 import math
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -47,8 +48,8 @@ def run_authentic_upstox_nifty_spreads(
     max_expiries: int = 26,
 ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """
-    Executes weekly Nifty credit spreads on real Upstox expired option candles.
-    Returns (trades_df, daily_equity_series, spot_df).
+    Replays weekly Nifty credit spreads on Upstox expired option candles.
+    Returns (trades_df, realized_equity_series, spot_df).
     """
     cfg = PortfolioConfig(initial_capital=capital)
 
@@ -71,22 +72,33 @@ def run_authentic_upstox_nifty_spreads(
     spot_df = spot_df.dropna()
 
     cur_capital = capital
+    previous_exit = None
     records: List[Dict] = []
+    skipped = Counter()
+    cheapest_rejected_lot = None
 
     print(f"3. Replaying {len(expiries)} real expired weekly Nifty expiries...")
     for exp_str in expiries:
         exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-        # Enter ~5 trading days prior to expiry
+        # Select strikes at the signal session's close, then enter at the next open.
         eligible_days = spot_df[spot_df.index.date < exp_date]
         if len(eligible_days) < 5:
+            skipped["insufficient Nifty spot history"] += 1
             continue
-        entry_row = eligible_days.iloc[-5]
-        entry_date = eligible_days.index[-5].date()
+        signal = eligible_days.iloc[-5]
+        entry_date = eligible_days.index[-4].date()
+        if previous_exit is not None and entry_date <= previous_exit:
+            skipped["previous spread still open at entry"] += 1
+            continue
+        sessions = spot_df.loc[(spot_df.index.date >= entry_date) & (spot_df.index.date <= exp_date), "close"]
+        if sessions.index[-1].date() != exp_date:
+            skipped["missing Nifty expiry-day close"] += 1
+            continue
 
-        S0 = float(entry_row["close"])
-        iv_est = max(float(entry_row["rv20"]) * cfg.vrp_iv_multiplier, 0.12)
+        S0 = float(signal["close"])
+        iv_est = max(float(signal["rv20"]) * cfg.vrp_iv_multiplier, 0.12)
         weekly_sd = S0 * iv_est * np.sqrt(7.0 / 365.0)
-        is_bull = entry_row["ema20"] >= entry_row["ema50"]
+        is_bull = signal["ema20"] >= signal["ema50"]
 
         if is_bull:
             opt_type = "PE"
@@ -101,67 +113,92 @@ def run_authentic_upstox_nifty_spreads(
 
         width = abs(short_k - long_k)
         if width < 50:
+            skipped["strike width below 50 points"] += 1
             continue
 
         contracts = load_upstox_expired_option_contracts(exp_str, "NSE_INDEX|Nifty 50")
         short_c = _find_contract(contracts, short_k, opt_type)
         long_c = _find_contract(contracts, long_k, opt_type)
         if not short_c or not long_c:
+            skipped["one or both selected contracts not returned"] += 1
             continue
 
-        lot_size = int(short_c.get("lot_size", 75))
+        lot_size = int(short_c.get("lot_size", 0))
+        if lot_size <= 0 or int(long_c.get("lot_size", 0)) != lot_size:
+            skipped["invalid or mismatched lot sizes"] += 1
+            continue
         from_str = entry_date.strftime("%Y-%m-%d")
 
-        short_df = load_upstox_expired_candles(short_c["expired_instrument_key"], exp_str, from_str, interval="day")
-        long_df = load_upstox_expired_candles(long_c["expired_instrument_key"], exp_str, from_str, interval="day")
+        short_key = short_c.get("expired_instrument_key") or short_c["instrument_key"]
+        long_key = long_c.get("expired_instrument_key") or long_c["instrument_key"]
+        short_df = load_upstox_expired_candles(short_key, exp_str, from_str, interval="day")
+        long_df = load_upstox_expired_candles(long_key, exp_str, from_str, interval="day")
         time.sleep(0.15)
 
         if short_df.empty or long_df.empty:
+            skipped["one or both option candle series empty"] += 1
             continue
 
-        joined = short_df[["close"]].rename(columns={"close": "short_c"}).join(
-            long_df[["close"]].rename(columns={"close": "long_c"}), how="inner"
-        )
-        if len(joined) < 2:
+        short_prices = short_df.set_index(short_df.index.date)[["open", "close"]]
+        long_prices = long_df.set_index(long_df.index.date)[["open", "close"]]
+        spread = (short_prices - long_prices).dropna(how="all")
+        if entry_date not in spread.index or not np.isfinite(spread.at[entry_date, "open"]):
+            skipped["missing option open on entry date"] += 1
             continue
 
-        # Entry credit after per-leg slippage
-        raw_credit = float(joined.iloc[0]["short_c"] - joined.iloc[0]["long_c"])
+        raw_credit = float(spread.at[entry_date, "open"])
         net_credit = raw_credit - (2.0 * slippage_pts_per_leg)
-        if net_credit <= 0:
+        if not (0 < net_credit <= raw_credit < width):
+            skipped["entry credit non-positive after slippage or outside spread bounds"] += 1
             continue
 
         max_loss_per_lot = max((width - net_credit) * lot_size + cost_per_lot, 1.0)
         risk_budget = cur_capital * cfg.spread_risk_per_week_pct
         lots = math.floor(risk_budget / max_loss_per_lot)
         if lots < 1:
-            # Skip if 1 whole lot exceeds the 1.5% risk cap
+            skipped["one lot exceeds risk budget"] += 1
+            cheapest_rejected_lot = min(cheapest_rejected_lot or max_loss_per_lot, max_loss_per_lot)
             continue
 
         exit_reason = "EXPIRY"
-        exit_date = joined.index[-1].date()
-        exit_val = float(joined.iloc[-1]["short_c"] - joined.iloc[-1]["long_c"])
-
-        for k in range(1, len(joined)):
-            val = float(joined.iloc[k]["short_c"] - joined.iloc[k]["long_c"])
-            if val <= net_credit * 0.35:
-                exit_val, exit_date, exit_reason = val, joined.index[k].date(), "TP_65PCT"
+        for timestamp, spot_close in sessions.items():
+            session = timestamp.date()
+            if session == exp_date:
+                if exit_reason != "EXPIRY" and session in spread.index and np.isfinite(spread.at[session, "open"]):
+                    val = float(spread.at[session, "open"])
+                    if 0 <= val <= width:
+                        exit_val = val
+                        break
+                # Nifty index options are cash settled at intrinsic value on expiry.
+                exit_reason = "EXPIRY"
+                direction = 1 if opt_type == "CE" else -1
+                exit_val = max(direction * (spot_close - short_k), 0) - max(direction * (spot_close - long_k), 0)
                 break
-            if val >= net_credit * 2.5:
-                exit_val, exit_date, exit_reason = val, joined.index[k].date(), "SL_2.5X"
-                break
 
-        # Exit cost (2 legs slippage if closed before expiry; 0 if expired OTM)
-        exit_slip = 0.0 if (exit_reason == "EXPIRY" and exit_val <= 0.1) else (2.0 * slippage_pts_per_leg)
+            # Once a close triggers an exit, price that exit at the next session's open.
+            price = "close" if exit_reason == "EXPIRY" else "open"
+            value = float(spread.at[session, price]) if session in spread.index else float("nan")
+            if not 0 <= value <= width:
+                raise RuntimeError(f"{exp_str}: missing or invalid option spread {price} on {session} after entry")
+            if price == "open":
+                exit_val = value
+                break
+            if value <= net_credit * 0.35:
+                exit_reason = "TP_65PCT"
+            elif value >= net_credit * 2.5:
+                exit_reason = "SL_2.5X"
+
+        exit_slip = 0.0 if exit_reason == "EXPIRY" else 2.0 * slippage_pts_per_leg
         net_pts = net_credit - (exit_val + exit_slip)
         net_pts = max(net_pts, -(width - net_credit))  # Capped by protective wing
         net_pnl = (net_pts * lot_size - cost_per_lot) * lots
         cur_capital += net_pnl
+        previous_exit = session
 
         records.append({
             "expiry": exp_str,
-            "entry_date": str(joined.index[0].date()),
-            "exit_date": str(exit_date),
+            "entry_date": str(entry_date),
+            "exit_date": str(session),
             "side": side,
             "short_strike": short_k,
             "long_strike": long_k,
@@ -173,6 +210,15 @@ def run_authentic_upstox_nifty_spreads(
             "equity_rs": round(cur_capital, 2),
             "exit_reason": exit_reason,
         })
+
+    print(f"Replay: {len(records)} trade(s), {sum(skipped.values())} skipped out of {len(expiries)} expiries.")
+    for reason, count in skipped.most_common():
+        print(f"  {count}: {reason}")
+    if cheapest_rejected_lot is not None:
+        risk_rate = cfg.spread_risk_per_week_pct
+        print(f"  Initial {risk_rate:.1%} risk budget: ₹{capital * risk_rate:,.2f}; "
+              f"lowest rejected one-lot max loss: ₹{cheapest_rejected_lot:,.2f} "
+              f"(requires ₹{cheapest_rejected_lot / risk_rate:,.2f} equity at that cap).")
 
     trades_df = pd.DataFrame(records)
     if trades_df.empty:
@@ -217,7 +263,7 @@ def main():
     )
 
     if real_df.empty:
-        print("No valid authentic Upstox spread trades completed (check risk budget vs 1-lot width or Upstox Plus access).")
+        print("No spreads qualified; no trade CSV was written.")
         return
 
     # Compare against Synthetic BSM over the exact same date window
