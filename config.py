@@ -1,4 +1,5 @@
 import os
+from math import isfinite
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
@@ -72,13 +73,13 @@ class PortfolioConfig:
 
 @dataclass
 class DeltaLiveConfig:
-    env: str = os.getenv("DELTA_ENV", "testnet").lower()
-    api_key: str = os.getenv("DELTA_API_KEY", "")
-    api_secret: str = os.getenv("DELTA_API_SECRET", "")
-    dry_run: bool = os.getenv("DRY_RUN", "true").lower() == "true"
+    env: str = field(default_factory=lambda: os.getenv("DELTA_ENV", "testnet").strip().lower())
+    api_key: str = field(default_factory=lambda: os.getenv("DELTA_API_KEY", ""), repr=False)
+    api_secret: str = field(default_factory=lambda: os.getenv("DELTA_API_SECRET", ""), repr=False)
+    dry_run: bool = field(default_factory=lambda: {"true": True, "false": False}.get(os.getenv("DRY_RUN", "true").strip().lower()))
 
     # Capital & Risk (Exact Test 2 Parameters)
-    capital_usd: float = float(os.getenv("DELTA_CAPITAL_USD", "1200.0"))
+    capital_usd: float = field(default_factory=lambda: float(os.getenv("DELTA_CAPITAL_USD", "1200.0")))
     risk_per_trade_pct: float = 0.01              # 1.0% risk per trade
     max_concurrent_risk_pct: float = 0.03         # 3.0% max total open risk
     max_crypto_concurrent: int = 2                # Max 2 open crypto positions
@@ -98,10 +99,23 @@ class DeltaLiveConfig:
     weekly_loss_limit_pct: float = 0.07           # Stop new entries at -7% weekly realized loss
 
     # Persistence & Alerts
-    state_file: str = "bot_state.json"
-    journal_file: str = "live_trade_journal.csv"
-    telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    state_file: str = ""
+    journal_file: str = ""
+    telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""), repr=False)
+    telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
+
+    def __post_init__(self):
+        if self.dry_run is not True and self.dry_run is not False:
+            raise ValueError("DRY_RUN must be true or false")
+        if self.env not in {"prod", "testnet"}:
+            raise ValueError("DELTA_ENV must be testnet or prod")
+        if not self.dry_run and self.env != "testnet":
+            raise ValueError("Production orders are disabled pending authenticated testnet validation")
+        if not isfinite(self.capital_usd) or self.capital_usd <= 0:
+            raise ValueError("DELTA_CAPITAL_USD must be positive and finite")
+        mode = f"{self.env}-{'paper' if self.dry_run else 'orders'}"
+        self.state_file = self.state_file or f"bot_state-{mode}.json"
+        self.journal_file = self.journal_file or f"trade_journal-{mode}.csv"
 
     @property
     def base_url(self) -> str:

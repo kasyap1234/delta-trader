@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--commodities", nargs="*", default=["GC=F"])
     parser.add_argument("--gold-etf", action="store_true", help="Use long-only GOLDIETF.NS instead of GC=F")
     parser.add_argument("--crypto-only", action="store_true", help="Crypto Donchian only (unlocks 2021-2023 intraday OOS)")
-    parser.add_argument("--whole-lots", action="store_true", help="Enforce strict whole-lot rounding")
+    parser.add_argument("--whole-lots", action="store_true", help="Round Donchian lots and exclude unverified historical option lots")
     args = parser.parse_args()
 
     donchian_rows = []
@@ -42,6 +42,8 @@ def main():
 
     print(f"\nRunning Timeframe Sweep: {args.intervals} | Window: {args.start or f'last {args.days}d'} -> {args.end or 'today'}")
     print(f"Risk/Trade: {args.risk*100:.1f}% | Max Concurrent Risk: {args.max_risk*100:.1f}% | Crypto-Only: {args.crypto_only}\n")
+    if args.whole_lots and not args.crypto_only:
+        print("Nifty options excluded in whole-lot mode: no historical contract lot and quote data.")
 
     for tf in args.intervals:
         print(f">>> Backtesting timeframe: {tf} ...")
@@ -81,7 +83,7 @@ def main():
                 "Gap Stops": res["diag"]["gap_stops"],
             })
 
-            if not args.crypto_only:
+            if res["cfg"].enable_credit_spreads:
                 combined_rows.append({
                     "TF": tf,
                     "Period": period_str,

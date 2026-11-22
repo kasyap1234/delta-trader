@@ -40,15 +40,25 @@ python run_timeframe_sweep.py --crypto-only --intervals 2h 4h 6h 12h 1d --start 
 # Hardened Test 2 (4H, 1% risk, 200-bar warmup, gap-aware stops, Silver dropped)
 python run_hardened_backtest.py --interval 4h --risk 0.01
 
-# Strict Rs 2L Executable Version (Long-Only GOLDIETF.NS + Whole Lots)
+# Whole-lot Donchian simulation with long-only GOLDIETF.NS
 python run_hardened_backtest.py --interval 4h --risk 0.01 --gold-etf --whole-lots
 ```
 
+Warmup candles feed indicators only; they do not extend `--days`. Whole-lot runs exclude the modeled Nifty sleeve because historical listed lot sizes and executable option quotes are not available. Other backtests still model that sleeve; they are not execution or live risk validation.
+
 ## Step 4: Live / Paper Execution
 ```bash
-# Engine A: Delta Exchange India 4H Bot (Starts in DELTA_ENV=testnet, DRY_RUN=true)
-python live_delta_donchian.py
+# Engine A: one public data cycle (remove --once for scheduled paper trading)
+DELTA_ENV=testnet DRY_RUN=true python live_delta_donchian.py --once
 
-# Engine B: Weekly Nifty Defined-Risk Credit Spread Advisor
-python live_nifty_spread_advisor.py --capital 200000 --lot-size 75
+# Engine B: show a Nifty candidate and verify the listed lot size
+python live_nifty_spread_advisor.py --capital 200000
 ```
+
+**Production order submission is disabled.** Before enabling testnet orders, use a dedicated [Delta India demo account](https://demo.delta.exchange) with no existing positions or orders, set ETHUSD/SOLUSD to 5× isolated leverage, and turn off automatic margin top-up and DETO commission. Configure testnet credentials locally and keep `DRY_RUN=true` until explicitly ready to send sandbox orders. `DELTA_ENV=prod DRY_RUN=true` can read public production market data but does not trade.
+
+Run only one bot per testnet account from a persistent working directory. Preserve `bot_state-testnet-orders.json` and its order IDs across restarts; paper state is stored separately. After an unresolved order response, missing protection, or unexpected account state, inspect the actual Delta orders, positions and fills before resuming. Do not delete the state file or retry an uncertain entry just to clear the error. An emergency close halts new entries even after reconciliation. Stop-market orders can fill beyond their trigger; margin and risk sizing are estimates, not guarantees.
+
+The Nifty advisor never sends orders. It requires `UPSTOX_ACCESS_TOKEN` for market status and quotes and `--cost-per-lot` for a conservative round-trip fee/tax allowance before recommending a conditional position. `--lot-size` is an optional cross-check, not an override. The displayed risk applies only if both legs fill as a single spread at or above the quoted minimum net credit and costs are within the allowance; never leg in based on the display.
+
+Run the offline regression checks with `python -m unittest -v`.

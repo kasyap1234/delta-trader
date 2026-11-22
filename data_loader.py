@@ -69,19 +69,21 @@ def resolve_date_window(
     """
     now_utc = datetime.now(timezone.utc)
     if end_date:
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
-        eval_end_ist = pd.Timestamp(end_date, tz="Asia/Kolkata") + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        eval_end_ist = pd.Timestamp(datetime.strptime(end_date, "%Y-%m-%d"), tz="Asia/Kolkata") + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        end_dt = eval_end_ist.tz_convert("UTC").to_pydatetime()
     else:
         end_dt = now_utc
         eval_end_ist = None
 
     if start_date:
-        base_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        eval_start_ist = pd.Timestamp(start_date, tz="Asia/Kolkata")
+        eval_start_ist = pd.Timestamp(datetime.strptime(start_date, "%Y-%m-%d"), tz="Asia/Kolkata")
+        base_start = eval_start_ist.tz_convert("UTC").to_pydatetime()
     else:
         base_start = end_dt - timedelta(days=days)
-        eval_start_ist = None
+        eval_start_ist = pd.Timestamp(base_start).tz_convert("Asia/Kolkata")
 
+    if base_start >= end_dt:
+        raise ValueError("Backtest start must precede its end")
     pad_days = WARMUP_CALENDAR_DAYS.get(interval, 60) if include_warmup else 0
     fetch_start = base_start - timedelta(days=pad_days)
     return fetch_start, end_dt, eval_start_ist, eval_end_ist

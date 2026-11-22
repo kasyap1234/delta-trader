@@ -119,7 +119,7 @@ def run_single_backtest(
         crypto_assets=crypto_syms,
         commodity_assets=commodities,
         spread_asset="NIFTY" if use_upstox_nifty else spread_asset,
-        enable_credit_spreads=not crypto_only,
+        enable_credit_spreads=not crypto_only and not whole_lots,
         whole_lot_rounding=whole_lots,
         spread_stress_penalty=spread_stress,
     )
@@ -132,6 +132,13 @@ def run_single_backtest(
     if verbose:
         window_desc = f"{start_date or f'last {days}d'} -> {end_date or 'today'}"
         print(f"\nLoading {interval} hardened dataset ({window_desc}, 200-bar warmup + gap-aware stops)...")
+        if whole_lots and not crypto_only:
+            print("  Nifty options excluded in whole-lot mode: no historical contract lot and quote data.")
+
+    if crypto_source == "delta":
+        for sym in crypto_syms:
+            if sym + "T" in cfg.lot_multipliers:
+                cfg.lot_multipliers[sym] = cfg.lot_multipliers[sym + "T"]
 
     for sym in crypto_syms:
         if verbose:
@@ -167,23 +174,15 @@ def run_single_backtest(
         spread_trades, spread_cum_pnl, collateral_cum_pnl = [], pd.Series(dtype=float), pd.Series(dtype=float)
 
     if not donchian_eq.empty and not spread_cum_pnl.empty:
-        start_dt = max(donchian_eq.index[0], spread_cum_pnl.index[0])
         common_idx = donchian_eq.index.union(spread_cum_pnl.index).sort_values()
-        common_idx = common_idx[common_idx >= start_dt]
     elif not donchian_eq.empty:
         common_idx = donchian_eq.index
     else:
         common_idx = spread_cum_pnl.index
 
-    donchian_pnl = (donchian_eq.reindex(common_idx).ffill().bfill() - cfg.initial_capital) if not donchian_eq.empty else pd.Series(0.0, index=common_idx)
-    if not spread_cum_pnl.empty:
-        spread_pnl = spread_cum_pnl.reindex(common_idx).ffill().fillna(0.0)
-        spread_pnl = spread_pnl - spread_pnl.iloc[0]
-        collat_pnl = collateral_cum_pnl.reindex(common_idx).ffill().fillna(0.0)
-        collat_pnl = collat_pnl - collat_pnl.iloc[0]
-    else:
-        spread_pnl = pd.Series(0.0, index=common_idx)
-        collat_pnl = pd.Series(0.0, index=common_idx)
+    donchian_pnl = (donchian_eq - cfg.initial_capital).reindex(common_idx).ffill().fillna(0.0)
+    spread_pnl = spread_cum_pnl.reindex(common_idx).ffill().fillna(0.0)
+    collat_pnl = collateral_cum_pnl.reindex(common_idx).ffill().fillna(0.0)
 
     eq_donchian = cfg.initial_capital + donchian_pnl
     eq_spreads_pure = cfg.initial_capital + spread_pnl
@@ -234,7 +233,7 @@ def main():
     parser.add_argument("--crypto-only", action="store_true", help="Run Crypto Donchian only (great for 2021-2023 4H OOS)")
     parser.add_argument("--spread-asset", default="^NSEI", help="Asset for Weekly Credit Spreads (default: ^NSEI)")
     parser.add_argument("--use-upstox-nifty", action="store_true", help="Fetch Nifty daily data from Upstox V3")
-    parser.add_argument("--whole-lots", action="store_true", help="Enforce strict whole-lot/contract rounding")
+    parser.add_argument("--whole-lots", action="store_true", help="Round Donchian lots and exclude unverified historical option lots")
     parser.add_argument("--spread-stress", type=float, default=0.0, help="Extra loss penalty on spread stop-outs (e.g. 0.15)")
     args = parser.parse_args()
 
@@ -262,6 +261,8 @@ def main():
     diag = res["diag"]
     all_trades = res["all_trades"]
     donchian_trades = res["donchian_trades"]
+    if common_idx.empty:
+        parser.exit(1, "No bars remain in the evaluation window after warmup.\n")
 
     print(f"\n================ HARDENED PORTFOLIO SUMMARY ({common_idx[0].date()} -> {common_idx[-1].date()}) ================")
     print(

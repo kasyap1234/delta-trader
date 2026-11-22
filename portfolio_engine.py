@@ -54,9 +54,7 @@ def add_donchian_features(
     df["donchian_high"] = df["high"].rolling(entry_len).max().shift(1)
     df["donchian_low"] = df["low"].rolling(entry_len).min().shift(1)
 
-    df = df.dropna()
-    if warmup_bars > 0 and len(df) > warmup_bars:
-        df = df.iloc[warmup_bars:].copy()
+    df = df.iloc[warmup_bars:].dropna()
 
     if eval_start is not None:
         df = df[df.index >= eval_start]
@@ -119,54 +117,7 @@ def run_shared_donchian_portfolio(
                 row = row.iloc[-1]
 
             prev = last_bar_map.get(sym)
-            pos = pos_map[sym]
-
-            # Step 1: Manage open position & gap-aware stop-loss
-            if pos is not None:
-                if sym in crypto_set:
-                    hours_elapsed = (ts - pos["last_funding_ts"]).total_seconds() / 3600.0
-                    if hours_elapsed >= 8.0:
-                        periods = int(hours_elapsed // 8)
-                        notional = float(row["close"]) * pos["qty"]
-                        pos["funding_paid"] += notional * cfg.crypto_funding_8h_pct * periods
-                        pos["last_funding_ts"] = ts
-
-                is_long = pos["side"] == "LONG"
-                sl_hit = (is_long and row["low"] <= pos["sl"]) or ((not is_long) and row["high"] >= pos["sl"])
-
-                if sl_hit:
-                    gapped = (is_long and row["open"] < pos["sl"]) or ((not is_long) and row["open"] > pos["sl"])
-                    if cfg.gap_aware_stops and gapped:
-                        raw_exit = float(row["open"])
-                        reason = "GAP_STOP"
-                        diagnostics["gap_stops"] += 1
-                    else:
-                        raw_exit = float(pos["sl"])
-                        reason = "ATR_TRAIL"
-
-                    exit_px = raw_exit * (1 - cfg.slippage_pct if is_long else 1 + cfg.slippage_pct)
-                    gross = _pnl(pos["side"], pos["entry"], exit_px, pos["qty"])
-                    net = gross - pos["funding_paid"]
-                    capital += net
-                    trades.append(
-                        PortfolioTrade(
-                            engine="DONCHIAN", asset=sym, side=pos["side"],
-                            entry_time=pos["entry_time"], exit_time=ts,
-                            entry_price=pos["entry"], exit_price=exit_px, qty=pos["qty"],
-                            gross_pnl=gross, funding_cost=pos["funding_paid"],
-                            net_pnl=net, r_multiple=net / pos["risk_rs"],
-                            exit_reason=reason,
-                        )
-                    )
-                    pos_map[sym] = None
-                else:
-                    trail = cfg.atr_trail_mult * float(row["atr14"])
-                    if is_long:
-                        pos["sl"] = max(pos["sl"], float(row["close"]) - trail)
-                    else:
-                        pos["sl"] = min(pos["sl"], float(row["close"]) + trail)
-
-            # Step 2: Check fresh entries on closed previous bar (`prev`), enter at `row.open`
+            # Enter at the open using only prior-bar information.
             if pos_map[sym] is None and prev is not None and prev["atr14"] > 0:
                 is_long_only = sym in cfg.long_only_assets
                 side = None
@@ -223,6 +174,43 @@ def run_shared_donchian_portfolio(
 
             last_bar_map[sym] = row
 
+        # Check stops only after evaluating every entry at this open. Intrabar exits
+        # cannot free capital or capacity for another entry at the same open.
+        for sym, pos in pos_map.items():
+            row = last_bar_map.get(sym)
+            if pos is None or row is None or row.name != ts:
+                continue
+            if sym in crypto_set:
+                periods = (ts - pos["last_funding_ts"]) // pd.Timedelta(hours=8)
+                if periods:
+                    pos["funding_paid"] += float(row["close"]) * pos["qty"] * cfg.crypto_funding_8h_pct * periods
+                    pos["last_funding_ts"] += periods * pd.Timedelta(hours=8)
+
+            is_long = pos["side"] == "LONG"
+            stop = pos["sl"]
+            sl_hit = row["low"] <= stop if is_long else row["high"] >= stop
+            if not sl_hit:
+                trail = cfg.atr_trail_mult * float(row["atr14"])
+                close = float(row["close"])
+                pos["sl"] = max(stop, close - trail) if is_long else min(stop, close + trail)
+                continue
+
+            gapped = row["open"] < stop if is_long else row["open"] > stop
+            gap_fill = cfg.gap_aware_stops and gapped
+            diagnostics["gap_stops"] += int(gap_fill)
+            raw_exit = float(row["open"]) if gap_fill else stop
+            exit_px = raw_exit * (1 - cfg.slippage_pct if is_long else 1 + cfg.slippage_pct)
+            gross = _pnl(pos["side"], pos["entry"], exit_px, pos["qty"])
+            net = gross - pos["funding_paid"]
+            capital += net
+            trades.append(PortfolioTrade(
+                engine="DONCHIAN", asset=sym, side=pos["side"], entry_time=pos["entry_time"], exit_time=ts,
+                entry_price=pos["entry"], exit_price=exit_px, qty=pos["qty"], gross_pnl=gross,
+                funding_cost=pos["funding_paid"], net_pnl=net, r_multiple=net / pos["risk_rs"],
+                exit_reason="GAP_STOP" if gap_fill else "ATR_TRAIL",
+            ))
+            pos_map[sym] = None
+
         unrealized = 0.0
         for sym, pos in pos_map.items():
             if pos is not None and sym in last_bar_map:
@@ -251,7 +239,7 @@ def run_shared_donchian_portfolio(
             )
 
     eq_series = pd.Series(
-        [v for _, v in equity_records],
+        [v for _, v in equity_records[:-1]] + [capital],
         index=pd.DatetimeIndex([t for t, _ in equity_records]),
         name="donchian_equity",
     )
