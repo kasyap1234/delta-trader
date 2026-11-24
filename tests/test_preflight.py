@@ -20,11 +20,11 @@ import requests
 
 import live_delta_donchian as delta
 import live_kotak_mcx_advisor as kotak
-import live_nifty_spread_advisor as nifty
-import validate_real_nifty_spreads as vns
 from config import DeltaLiveConfig, KotakMcxConfig, PortfolioConfig
 from data_loader import load_delta_candles, resolve_date_window
 from portfolio_engine import run_shared_donchian_portfolio
+from research import nifty_options_replay as vns
+from research import nifty_spread_tickets as nifty
 
 
 if not hasattr(unittest.TestCase, "enterContext"):
@@ -761,3 +761,346 @@ class ConfigCMaxAggressionTest(unittest.TestCase):
         self.assertEqual(summary["symbols"], ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "DOGEUSD"])
         for pid in (1, 2, 3, 4, 5):
             self.assertEqual(self.exchange.leverage_by_product[pid], 5)
+
+
+class UpstoxKotakParityTest(unittest.TestCase):
+    def setUp(self):
+        self.location = self.enterContext(tempfile.TemporaryDirectory())
+
+    def test_resolve_upstox_key_for_mcx_goldpetal_and_nse_silverbees(self):
+        import data_loader as dl
+
+        now_ms = int(time.time() * 1000)
+        mcx_master = gzip.compress(json.dumps([
+            {"instrument_type": "FUT", "trading_symbol": "GOLDPETAL25NOVFUT", "name": "GOLDPETAL",
+             "expiry": now_ms - 86_400_000, "instrument_key": "MCX_FO|EXPIRED"},
+            {"instrument_type": "FUT", "trading_symbol": "GOLDPETAL26DECFUT", "name": "GOLDPETAL",
+             "expiry": now_ms + 30 * 86_400_000, "instrument_key": "MCX_FO|NEXT"},
+            {"instrument_type": "FUT", "trading_symbol": "GOLDPETAL26NOVFUT", "name": "GOLDPETAL",
+             "expiry": now_ms + 5 * 86_400_000, "instrument_key": "MCX_FO|NEAR"},
+        ]).encode())
+        nse_master = gzip.compress(json.dumps([
+            {"segment": "NSE_EQ", "trading_symbol": "SILVERBEES", "instrument_key": "NSE_EQ|INF204KC1402"},
+        ]).encode())
+
+        def fake_get(url, **kwargs):
+            if url == dl.UPSTOX_MASTERS["MCX"]:
+                return SimpleNamespace(raise_for_status=lambda: None, content=mcx_master)
+            if url == dl.UPSTOX_MASTERS["NSE"]:
+                return SimpleNamespace(raise_for_status=lambda: None, content=nse_master)
+            raise AssertionError(url)
+
+        with patch.object(dl.requests, "get", side_effect=fake_get):
+            self.assertEqual(dl.resolve_upstox_key("GOLDPETAL", "MCX"), "MCX_FO|NEAR")
+            self.assertEqual(dl.resolve_upstox_key("SILVERBEES.NS", "NSE"), "NSE_EQ|INF204KC1402")
+            self.assertEqual(dl.resolve_upstox_key("SILVERBEES", "NSE"), "NSE_EQ|INF204KC1402")
+
+    def test_drop_unclosed_bars_filters_in_progress_ist_bucket(self):
+        import data_loader as dl
+
+        idx = pd.date_range("2026-11-22 00:00", periods=5, freq="6h", tz="Asia/Kolkata")
+        df = bars(idx, 100.0, 1.0)
+        # At 17:32 IST, the 12:00 IST bar is still in progress; only 00:00 and 06:00 are closed.
+        now_ist = pd.Timestamp("2026-11-22 17:32", tz="Asia/Kolkata")
+        closed = dl.drop_unclosed_bars(df, "6h", now=now_ist)
+        self.assertEqual(list(closed.index), list(idx[:2]))
+        # At 18:02 IST, the 12:00 IST bar is closed, while 18:00 IST is in progress.
+        closed_after = dl.drop_unclosed_bars(df, "6h", now=pd.Timestamp("2026-11-22 18:02", tz="Asia/Kolkata"))
+        self.assertEqual(list(closed_after.index), list(idx[:3]))
+
+    def test_load_upstox_merges_intraday_candles(self):
+        import data_loader as dl
+
+        hist_candles = [
+            ["2026-11-21T09:15:00+05:30", 100.0, 102.0, 99.0, 101.0, 1000, 0],
+            ["2026-11-21T10:15:00+05:30", 101.0, 103.0, 100.0, 102.0, 1200, 0],
+        ]
+        intra_candles = [
+            ["2026-11-22T09:15:00+05:30", 102.0, 105.0, 101.5, 104.0, 1500, 0],
+        ]
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            if "/historical-candle/intraday/" in url:
+                return SimpleNamespace(ok=True, status_code=200, json=lambda: {"data": {"candles": intra_candles}})
+            return SimpleNamespace(ok=True, status_code=200, json=lambda: {"data": {"candles": hist_candles}})
+
+        with (
+            patch.dict(os.environ, {"UPSTOX_ACCESS_TOKEN": "test-token"}),
+            patch.object(dl, "resolve_upstox_key", return_value="NSE_EQ|SILVERBEES"),
+            patch.object(dl.requests, "get", side_effect=fake_get),
+            patch.object(dl.time, "sleep"),
+        ):
+            df = dl.load_upstox("SILVERBEES", interval="6h", days=2, exchange="NSE", include_warmup=False, include_intraday=True)
+        self.assertTrue(any("/historical-candle/intraday/" in u for u in calls))
+        self.assertEqual(len(df), 2)
+        self.assertAlmostEqual(float(df["close"].iloc[-1]), 104.0)
+
+    def test_kotak_advisor_native_upstox_inr_closed_bar_mtm_dd_and_pyramid_cap(self):
+        cfg = KotakMcxConfig(
+            capital_inr=98_000.0, data_source="upstox", resolution="6h",
+            data_dir=self.location, telegram_token="", telegram_chat_id="",
+        )
+        adv = kotak.KotakMcxAdvisor(cfg)
+        idx = pd.date_range("2026-08-01 00:00", periods=245, freq="6h", tz="Asia/Kolkata")
+        # Rising INR series for GOLDPETAL (~Rs 9,500 -> ~Rs 10,000); last bar is unclosed and has a fake crash.
+        df = bars(idx, 9500.0, 2.0)
+        df.iloc[-1, df.columns.get_loc("close")] = 5000.0
+        df.iloc[-1, df.columns.get_loc("low")] = 4900.0
+        now_ist = idx[-1] + pd.Timedelta(minutes=30)
+
+        # Native INR mode must ignore unclosed bar and use exact INR price (~9,986), not USD/oz scaled.
+        report = adv.evaluate_symbol("GOLDPETAL", df, paper_auto=True, now=now_ist)
+        self.assertIn("PAPER ENTRY: LONG GOLDPETAL", report)
+        pos = adv.state["positions"]["GOLDPETAL"]
+        self.assertAlmostEqual(pos["entry_inr"], round(float(df["close"].iloc[-2]) * 1.0005, 2), places=2)
+
+        # Mark-to-market DD brake: simulate 20% unrealized drawdown on open position -> brake activates.
+        pos["qty"] = 10
+        pos["entry_inr"] = 10_000.0
+        dd, eff_risk, eff_max = adv._update_dd_brake({"GOLDPETAL": 8_000.0})
+        self.assertGreaterEqual(dd, 0.15)
+        self.assertTrue(adv.state["dd_brake_active"])
+        self.assertAlmostEqual(eff_risk, 0.0125)
+        self.assertAlmostEqual(eff_max, 0.04)
+
+        # Pyramid budget cap: if SILVERBEES already uses ~95% of cash, pyramid budget caps add_qty cleanly.
+        adv.state["positions"] = {
+            "SILVERBEES.NS": {"side": "LONG", "qty": 950, "entry_inr": 100.0, "init_entry_inr": 100.0,
+                              "init_sl_dist_inr": 5.0, "sl_inr": 102.0, "risk_pct": 0.02, "pyramided": False}
+        }
+        self.assertEqual(adv._pyramid_budget_qty("SILVERBEES.NS", price_inr=110.0), 27)  # (98000 - 95000) // 110 = 27
+
+    def test_two_broker_backtest_upstox_mode_uses_native_inr(self):
+        from research import portfolio_backtest as pb
+
+        idx = pd.date_range("2025-01-01 00:00", periods=260, freq="6h", tz="Asia/Kolkata")
+        crypto_df = bars(idx, 2000.0, 1.0)
+        gold_df = bars(idx, 9000.0, 2.0)
+        silver_df = bars(idx, 100.0, 0.05)
+
+        def fake_upstox(symbol, **kwargs):
+            return gold_df if symbol == "GOLDPETAL" else silver_df
+
+        with (
+            patch.object(pb, "load_delta_candles", return_value=crypto_df),
+            patch.object(pb, "load_upstox", side_effect=fake_upstox) as upstox_mock,
+        ):
+            res = pb.run_two_broker_backtest(
+                interval="6h", start_date="2025-02-25", end_date="2025-03-10",
+                crypto_source="delta", kotak_source="upstox", verbose=False,
+            )
+        self.assertEqual(upstox_mock.call_count, 2)
+        self.assertEqual(res["kotak_source"], "upstox")
+        self.assertGreater(len(res["mcx_trades"]), 0)
+        # Native INR GOLDPETAL trade entry should be ~Rs 9,400+ (not multiplied by 85x USD/INR).
+        gp_trades = [t for t in res["mcx_trades"] if t.asset == "GOLDPETAL"]
+        self.assertGreater(len(gp_trades), 0)
+        self.assertTrue(9000.0 <= gp_trades[0].entry_price <= 11000.0)
+
+
+class ThreePodLiveEngineTest(unittest.TestCase):
+    def setUp(self):
+        self.location = self.enterContext(tempfile.TemporaryDirectory())
+        self.exchange = DeltaFixture()
+        self.end = pd.Timestamp.now(tz="UTC").floor("6h") - pd.Timedelta(hours=6)
+        self.start = 2000.0
+        self.enterContext(patch.object(delta.requests, "request", self.exchange.request))
+        self.enterContext(patch.object(delta, "load_delta_candles", self._candles))
+        self.enterContext(patch.object(delta.time, "sleep"))
+
+    def _candles(self, symbol, **kwargs):
+        return bars(pd.date_range(end=self.end, freq="6h", periods=300), self.start, 1.0)
+
+    def test_3pod_state_file_isolation_and_config_validation(self):
+        cfg = DeltaLiveConfig(env="testnet", dry_run=True, strategy_mode="3pod", data_dir=self.location)
+        self.assertIn("bot_state-3pod-testnet-paper.json", cfg.state_file)
+        self.assertIn("trade_journal-3pod-testnet-paper.csv", cfg.journal_file)
+        with self.assertRaisesRegex(ValueError, "DELTA_STRATEGY_MODE"):
+            DeltaLiveConfig(strategy_mode="invalid", data_dir=self.location)
+
+    def test_3pod_paper_mode_nets_pods_and_clears_on_stop_hit(self):
+        cfg = DeltaLiveConfig(
+            env="testnet", dry_run=True, strategy_mode="3pod", symbols=["ETHUSD"],
+            capital_usd=1200.0, resolution="6h", telegram_token="", telegram_chat_id="",
+            data_dir=self.location,
+        )
+        eng = delta.LiveDonchianEngine(cfg)
+        eng.run_cycle()
+        # Rising trend fires Donchian (and/or TSMOM if on 48h slot), creating a netted LONG position with a protective stop.
+        self.assertIn("ETHUSD", eng.state["positions"])
+        pos = eng.state["positions"]["ETHUSD"]
+        self.assertEqual(pos["side"], "LONG")
+        self.assertGreater(pos["contracts"], 0)
+        self.assertGreater(float(pos["sl_price"]), 0.0)
+        self.assertTrue(len(eng.state["pods"]["ETHUSD"]) >= 1)
+
+        # Simulate intrabar stop hit on next bar -> closes netted position and clears all virtual pods.
+        next_bar = self.end + pd.Timedelta(hours=6)
+        self.end = next_bar
+        hit_frame = bars(pd.date_range(end=self.end, freq="6h", periods=300), self.start, 1.0)
+        hit_frame.iloc[-1, hit_frame.columns.get_loc("low")] = 1000.0
+        fake_now = self.end + pd.Timedelta(hours=6, seconds=15)
+        with (patch.object(delta, "load_delta_candles", return_value=hit_frame),
+              patch.object(delta.pd.Timestamp, "now", return_value=fake_now)):
+            eng.run_cycle()
+        # Either stopped out and flat, or re-entered cleanly; verify journal logged the exit.
+        self.assertTrue(os.path.exists(cfg.journal_file))
+
+    def test_3pod_testnet_orders_reconcile_single_protective_stop(self):
+        cfg = DeltaLiveConfig(
+            env="testnet", dry_run=False, strategy_mode="3pod", symbols=["ETHUSD"],
+            capital_usd=1200.0, resolution="6h", telegram_token="", telegram_chat_id="",
+            data_dir=self.location,
+        )
+        eng = delta.LiveDonchianEngine(cfg)
+        eng.run_cycle()
+        self.assertGreater(self.exchange.position, 0)
+        self.assertIsNotNone(self.exchange.stop)
+        self.assertEqual(self.exchange.stop["size"], self.exchange.position)
+        self.assertEqual(eng.state["positions"]["ETHUSD"]["contracts"], self.exchange.position)
+
+        # If exchange stop fills while bot is asleep, next cycle reconciles exit and clears virtual pods.
+        self.exchange.close_at_stop()
+        eng2 = delta.LiveDonchianEngine(cfg)
+        self.end += pd.Timedelta(hours=6)
+        fake_now = self.end + pd.Timedelta(hours=6, seconds=15)
+        with patch.object(delta.pd.Timestamp, "now", return_value=fake_now):
+            eng2.run_cycle()
+        with open(cfg.journal_file) as f:
+            rows = list(csv.DictReader(f))
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertEqual(float(rows[0]["exit_price"]), 2244.9)
+
+    def test_pod4_funding_volume_squeeze_triggers_and_gates_on_funding(self):
+        cfg = DeltaLiveConfig(
+            env="testnet", dry_run=True, strategy_mode="3pod", symbols=["ETHUSD"],
+            capital_usd=1200.0, resolution="6h", telegram_token="", telegram_chat_id="",
+            pod_weight_donchian=0.0, pod_weight_supertrend=0.0, pod_weight_tsmom=0.0,
+            pod_weight_squeeze=0.35, data_dir=self.location,
+        )
+        surge_df = bars(pd.date_range(end=self.end, freq="6h", periods=300), self.start, 1.0)
+        surge_df.iloc[-1, surge_df.columns.get_loc("volume")] = 50.0  # 5x volume surge
+        # Crowded funding (> 0.00005) -> should skip LONG squeeze
+        eng_skip = delta.LiveDonchianEngine(cfg)
+        with (patch.object(delta, "load_delta_candles", return_value=surge_df),
+              patch.object(delta, "load_delta_funding_avg", return_value=0.0002)):
+            eng_skip.run_cycle()
+        self.assertNotIn("ETHUSD", eng_skip.state["positions"])
+
+        # Low/negative funding (<= 0.00005) -> should trigger Pod 4 SQUEEZE LONG
+        cfg2 = DeltaLiveConfig(
+            env="testnet", dry_run=True, strategy_mode="3pod", symbols=["ETHUSD"],
+            capital_usd=1200.0, resolution="6h", telegram_token="", telegram_chat_id="",
+            pod_weight_donchian=0.0, pod_weight_supertrend=0.0, pod_weight_tsmom=0.0,
+            pod_weight_squeeze=0.35, data_dir=self.location,
+            state_file=f"{self.location}/sq.json", journal_file=f"{self.location}/sq.csv",
+        )
+        eng_ok = delta.LiveDonchianEngine(cfg2)
+        with (patch.object(delta, "load_delta_candles", return_value=surge_df),
+              patch.object(delta, "load_delta_funding_avg", return_value=0.00002)):
+            eng_ok.run_cycle()
+        self.assertIn("SQUEEZE", eng_ok.state["pods"]["ETHUSD"])
+        self.assertEqual(eng_ok.state["positions"]["ETHUSD"]["side"], "LONG")
+
+
+class KotakRotationTest(unittest.TestCase):
+    def setUp(self):
+        self.location = self.enterContext(tempfile.TemporaryDirectory())
+
+    def test_rotation_state_isolation_and_config_validation(self):
+        cfg = KotakMcxConfig(strategy_mode="rotation", data_dir=self.location)
+        self.assertTrue(cfg.state_file.endswith("kotak_rotation_state.json"))
+        self.assertTrue(cfg.journal_file.endswith("kotak_rotation_journal.csv"))
+        with self.assertRaisesRegex(ValueError, "KOTAK_STRATEGY_MODE"):
+            KotakMcxConfig(strategy_mode="bad_mode", data_dir=self.location)
+
+    def test_rotation_selects_top2_inverse_vol_and_parks_cash_when_weak(self):
+        from portfolio_engine import select_rotation_targets
+
+        idx = pd.date_range("2026-01-01", periods=90, freq="B", tz="Asia/Kolkata")
+        dfs = {
+            "GOLDBEES": bars(idx, 80.0, 0.4),      # strong uptrend
+            "SILVERBEES": bars(idx, 100.0, 0.7),   # strongest uptrend
+            "NIFTYBEES": bars(idx, 250.0, 0.1),    # mild uptrend
+            "ITBEES": bars(idx, 45.0, -0.2),       # downtrend (disqualified)
+        }
+        sel = select_rotation_targets(dfs, top_k=2)
+        self.assertEqual(set(sel["chosen"]), {"SILVERBEES", "GOLDBEES"})
+        self.assertAlmostEqual(sum(sel["weights"].values()), 1.0, places=6)
+        self.assertAlmostEqual(sel["cash_weight"], 0.0, places=6)
+
+        # Only 1 ETF qualifying -> 50% invested, 50% cash in LIQUIDBEES
+        dfs_one = {
+            "GOLDBEES": bars(idx, 80.0, 0.4),
+            "ITBEES": bars(idx, 45.0, -0.2),
+        }
+        sel_one = select_rotation_targets(dfs_one, top_k=2)
+        self.assertEqual(sel_one["chosen"], ["GOLDBEES"])
+        self.assertAlmostEqual(sel_one["weights"]["GOLDBEES"], 0.5, places=6)
+        self.assertAlmostEqual(sel_one["cash_weight"], 0.5, places=6)
+
+    def test_rotation_paper_auto_enters_holds_and_rotates_on_rebal_day(self):
+        cfg = KotakMcxConfig(
+            strategy_mode="rotation",
+            data_source="upstox",
+            capital_inr=98_000.0,
+            rotation_symbols=["GOLDBEES", "SILVERBEES", "NIFTYBEES"],
+            rotation_top_k=2,
+            rotation_rebal_days=10,
+            data_dir=self.location,
+            telegram_token="",
+            telegram_chat_id="",
+        )
+        adv = kotak.KotakMcxAdvisor(cfg)
+        idx1 = pd.date_range("2026-01-01", periods=80, freq="B", tz="Asia/Kolkata")
+        data_day1 = {
+            "GOLDBEES": bars(idx1, 80.0, 0.5),
+            "SILVERBEES": bars(idx1, 100.0, 0.8),
+            "NIFTYBEES": bars(idx1, 250.0, -0.3),
+        }
+        now1 = idx1[-1] + pd.Timedelta(hours=16)  # 16:00 IST (NSE closed)
+        with patch.object(kotak, "load_upstox", side_effect=lambda sym, **kw: data_day1[sym]):
+            rep1 = adv.run_once(paper_auto=True, now=now1)
+        self.assertIn("PAPER BUY", rep1)
+        self.assertEqual(set(adv.state["positions"].keys()), {"GOLDBEES", "SILVERBEES"})
+        self.assertEqual(adv.state["bars_since_rebal"], 0)
+
+        # Next trading day: should HOLD (not rebalance yet)
+        idx2 = pd.date_range("2026-01-01", periods=81, freq="B", tz="Asia/Kolkata")
+        data_day2 = {
+            "GOLDBEES": bars(idx2, 80.0, 0.5),
+            "SILVERBEES": bars(idx2, 100.0, 0.8),
+            "NIFTYBEES": bars(idx2, 250.0, -0.3),
+        }
+        now2 = idx2[-1] + pd.Timedelta(hours=16)
+        with patch.object(kotak, "load_upstox", side_effect=lambda sym, **kw: data_day2[sym]):
+            rep2 = adv.run_once(paper_auto=True, now=now2)
+        self.assertIn("HOLD (Next rebalance in 9 trading day(s))", rep2)
+
+        # Fast-forward to rebalance day where GOLDBEES drops out and NIFTYBEES leads
+        adv.state["bars_since_rebal"] = 9
+        idx3 = pd.date_range("2026-01-01", periods=82, freq="B", tz="Asia/Kolkata")
+        data_day3 = {
+            "GOLDBEES": bars(idx3, 120.0, -0.5),
+            "SILVERBEES": bars(idx3, 100.0, 0.8),
+            "NIFTYBEES": bars(idx3, 200.0, 1.2),
+        }
+        now3 = idx3[-1] + pd.Timedelta(hours=16)
+        with patch.object(kotak, "load_upstox", side_effect=lambda sym, **kw: data_day3[sym]):
+            rep3 = adv.run_once(paper_auto=True, now=now3)
+        self.assertIn("PAPER SELL GOLDBEES", rep3)
+        self.assertIn("PAPER BUY NIFTYBEES", rep3)
+        self.assertEqual(set(adv.state["positions"].keys()), {"SILVERBEES", "NIFTYBEES"})
+        self.assertTrue(os.path.exists(cfg.journal_file))
+        with open(cfg.journal_file) as f:
+            j_rows = list(csv.DictReader(f))
+        actions = [r["action"] for r in j_rows]
+        self.assertIn("BUY", actions)
+        self.assertIn("SELL", actions)
+        eq_path = os.path.join(self.location, "kotak_rotation_equity.csv")
+        self.assertTrue(os.path.exists(eq_path))
+        with open(eq_path) as f:
+            e_rows = list(csv.DictReader(f))
+        self.assertEqual(len(e_rows), 3)

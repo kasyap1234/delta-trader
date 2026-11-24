@@ -56,6 +56,25 @@ def _resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     )
 
 
+def drop_unclosed_bars(
+    df: pd.DataFrame,
+    interval: str,
+    now: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """Drops any bar whose IST bucket has not yet closed as of `now`."""
+    if df.empty:
+        return df
+
+    now_ist = (
+        pd.Timestamp.now(tz="Asia/Kolkata")
+        if now is None
+        else (pd.Timestamp(now).tz_localize("Asia/Kolkata") if pd.Timestamp(now).tzinfo is None else pd.Timestamp(now).tz_convert("Asia/Kolkata"))
+    )
+    period = pd.Timedelta("1D" if interval == "1d" else interval)
+    current_bucket = now_ist.floor(period)
+    return df.loc[df.index < current_bucket]
+
+
 def resolve_date_window(
     interval: str,
     days: int = 730,
@@ -198,6 +217,39 @@ def load_delta_candles(
         df = _resample_ohlcv(native, "12h").loc[complete].tz_convert("Asia/Kolkata")
     return df
 
+def load_delta_funding_avg(
+    symbol: str,
+    days: int = 4,
+    base_url: str = DELTA_INDIA_BASE,
+) -> Optional[float]:
+    """
+    Fetches recent 6h funding-rate candles (`FUNDING:{symbol}`) from Delta Exchange India
+    and returns the 3-day average 8h-equivalent funding rate in decimal form
+    (Delta quotes funding candles in percent, so 0.005 -> 0.00005).
+    Returns None if unavailable (fail-closed for Pod 4 Squeeze entries).
+    """
+    try:
+        end_s = int(datetime.now(timezone.utc).timestamp())
+        start_s = end_s - days * 86400
+        r = requests.get(
+            f"{base_url}/v2/history/candles",
+            params={"resolution": "6h", "symbol": f"FUNDING:{symbol.upper()}", "start": start_s, "end": end_s},
+            timeout=10,
+        )
+        r.raise_for_status()
+        rows = r.json().get("result", [])
+        if not rows:
+            return None
+        vals = [float(x["close"]) / 100.0 for x in rows if x.get("close") is not None]
+        if not vals:
+            return None
+        # Last 12 6h bars = 3 days
+        recent = vals[:12]
+        return float(sum(recent) / len(recent))
+    except Exception:
+        return None
+
+
 
 def load_yfinance(
     symbol: str,
@@ -255,40 +307,74 @@ def load_yfinance(
     return df
 
 
+
+# Extra warmup calendar days for Indian exchanges (5 trading days/week, 6.25h NSE / ~14.5h MCX)
+UPSTOX_WARMUP_CALENDAR_DAYS = {
+    "1h": 60,
+    "2h": 95,
+    "4h": 135,
+    "6h": 175,
+    "12h": 270,
+    "1d": 340,
+}
+
+
 def resolve_upstox_key(symbol: str, exchange: str = "NSE") -> str:
     if "|" in symbol:
         return symbol
-    sym_upper = symbol.upper()
+    sym_upper = symbol.upper().strip()
+    if sym_upper.endswith(".NS"):
+        sym_upper = sym_upper[:-3]
     if sym_upper in ("NIFTY", "NIFTY50", "^NSEI"):
         return "NSE_INDEX|Nifty 50"
     if sym_upper in ("BANKNIFTY", "^NSEBANK"):
         return "NSE_INDEX|Nifty Bank"
 
-    exch = "MCX" if exchange.upper() == "MCX" or sym_upper.startswith(("CRUDE", "GOLDM", "SILVERM")) else "NSE"
+    exch = (
+        "MCX"
+        if exchange.upper() == "MCX"
+        or sym_upper.startswith(("CRUDE", "GOLD", "SILVERM", "SILVERMIC", "NATURALGAS", "COPPER", "ZINC", "ALUMINIUM", "LEAD"))
+        and not sym_upper.endswith(("BEES", "IETF", "CASE"))
+        else "NSE"
+    )
     resp = requests.get(UPSTOX_MASTERS[exch], timeout=20)
     resp.raise_for_status()
     instruments = json.loads(gzip.decompress(resp.content).decode("utf-8"))
 
     if exch == "MCX":
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         matches = [
             inst for inst in instruments
             if inst.get("instrument_type") == "FUT"
-            and inst.get("trading_symbol", "").startswith(sym_upper)
+            and (
+                str(inst.get("trading_symbol", "")).upper().startswith(sym_upper)
+                or str(inst.get("name", "")).upper() == sym_upper
+            )
             and inst.get("expiry") is not None
         ]
         if not matches:
             raise ValueError(f"No active MCX futures found for {sym_upper}")
-        matches.sort(key=lambda x: x["expiry"])
-        return matches[0]["instrument_key"]
+        active = [m for m in matches if int(m["expiry"]) >= now_ms]
+        pool = active if active else matches
+        pool.sort(key=lambda x: int(x["expiry"]))
+        return pool[0]["instrument_key"]
     else:
         matches = [
             inst for inst in instruments
             if inst.get("segment") == "NSE_EQ"
-            and inst.get("trading_symbol", "").upper() == sym_upper
+            and str(inst.get("trading_symbol", "")).upper() == sym_upper
         ]
         if not matches:
             raise ValueError(f"No NSE_EQ instrument found for {sym_upper}")
         return matches[0]["instrument_key"]
+
+
+def _parse_upstox_candles(candles: list) -> pd.DataFrame:
+    df_c = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    df_c["timestamp"] = pd.to_datetime(df_c["timestamp"], utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df_c[col] = df_c[col].astype(float)
+    return df_c[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
 def load_upstox(
@@ -299,18 +385,26 @@ def load_upstox(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     include_warmup: bool = True,
+    include_intraday: bool = False,
 ) -> pd.DataFrame:
     token = os.getenv("UPSTOX_ACCESS_TOKEN")
     if not token:
         raise ValueError("UPSTOX_ACCESS_TOKEN missing in .env")
 
+    if interval not in SUPPORTED_INTERVALS:
+        raise ValueError(f"Unsupported interval {interval}. Choose from {SUPPORTED_INTERVALS}")
+
     key = resolve_upstox_key(symbol, exchange)
     fetch_start, fetch_end, _, _ = resolve_date_window(interval, days, start_date, end_date, include_warmup)
+    if include_warmup:
+        extra_pad = max(UPSTOX_WARMUP_CALENDAR_DAYS.get(interval, 60) - WARMUP_CALENDAR_DAYS.get(interval, 60), 0)
+        if extra_pad > 0:
+            fetch_start = fetch_start - timedelta(days=extra_pad)
 
     if interval == "1d":
         unit, step, chunk_days = "days", 1, 365
     else:
-        # Fetch 1h from Upstox V3 and resample to 2h/4h/6h/12h for consistent alignment
+        # Fetch 1h from Upstox V3 and resample to 2h/4h/6h/12h for consistent IST alignment
         unit, step, chunk_days = "hours", 1, 85
 
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -330,11 +424,19 @@ def load_upstox(
             raise RuntimeError(f"Upstox historical candle error (HTTP {r.status_code}) for {symbol}: {r.text[:200]}")
         candles = r.json().get("data", {}).get("candles", [])
         if candles:
-            df_c = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-            df_c["timestamp"] = pd.to_datetime(df_c["timestamp"], utc=True)
-            frames.append(df_c[["timestamp", "open", "high", "low", "close", "volume"]])
+            frames.append(_parse_upstox_candles(candles))
         cur_end = cur_start - timedelta(days=1)
         time.sleep(0.2)
+
+    if include_intraday and end_date is None:
+        intraday_url = f"{UPSTOX_BASE}/historical-candle/intraday/{encoded_key}/{unit}/{step}"
+        r = requests.get(intraday_url, headers=headers, timeout=15)
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"Upstox authentication failed (HTTP {r.status_code}); refresh UPSTOX_ACCESS_TOKEN")
+        if r.ok:
+            candles = r.json().get("data", {}).get("candles", [])
+            if candles:
+                frames.append(_parse_upstox_candles(candles))
 
     if not frames:
         raise RuntimeError(f"No Upstox data for {symbol}")
@@ -343,6 +445,7 @@ def load_upstox(
     if interval in ("2h", "4h", "6h", "12h"):
         df = _resample_ohlcv(df, interval)
     return df
+
 
 
 # ---------------------------------------------------------------------------

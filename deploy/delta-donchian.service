@@ -1,5 +1,5 @@
 [Unit]
-Description=Delta Exchange India 6H Multi-Coin Donchian Bot (Config C)
+Description=Delta Exchange India 6H 3-Pod Balanced Crypto Bot (Donchian + Supertrend+ADX + TSMOM)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=simple
 User=__APP_USER__
 WorkingDirectory=__APP_DIR__
 EnvironmentFile=__APP_DIR__/.env
-ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/live_delta_donchian.py
+ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/live_delta_donchian.py --strategy 3pod
 Restart=on-failure
 RestartSec=30
 MemoryMax=512M

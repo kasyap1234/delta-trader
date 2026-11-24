@@ -28,6 +28,7 @@ from data_loader import (
     load_upstox_expired_option_contracts,
 )
 from portfolio_engine import run_weekly_credit_spreads
+from research.outputs import new_run_directory
 
 
 def _round_to_strike(px: float, step: int = 50) -> int:
@@ -279,8 +280,9 @@ def main():
 
     print(f"\n================ REAL UPSTOX OPTIONS VS. BSM ({real_df['entry_date'].iloc[0]} -> {real_df['exit_date'].iloc[-1]}) ================\n")
     print(summary.to_string(index=False))
-    real_df.to_csv("real_nifty_spreads_trades.csv", index=False)
-    print("\nSaved trade log: real_nifty_spreads_trades.csv")
+    trade_path = new_run_directory("nifty-options-replay") / "spread_trades.csv"
+    real_df.to_csv(trade_path, index=False)
+    print(f"\nSaved trade log: {trade_path}")
 
 
 if __name__ == "__main__":

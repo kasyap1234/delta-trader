@@ -1,5 +1,5 @@
 [Unit]
-Description=Kotak Neo MCX GOLDPETAL + NSE SILVERBEES 6H Paper/Signal Runner
+Description=Kotak Neo All-6 Top-2 Vol-Parity NSE ETF Rotation Paper/Signal Runner
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=oneshot
 User=__APP_USER__
 WorkingDirectory=__APP_DIR__
 EnvironmentFile=__APP_DIR__/.env
-ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/live_kotak_mcx_advisor.py --paper-auto
+ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/live_kotak_mcx_advisor.py --strategy rotation --paper-auto
 MemoryMax=384M
 NoNewPrivileges=true
 StandardOutput=journal

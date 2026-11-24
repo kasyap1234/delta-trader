@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Kotak Neo MCX/ETF Advisor 2 minutes after every 6H UTC bar close
+Description=Run Kotak Neo NSE ETF Rotation Advisor after NSE close (Mon-Fri 15:45 IST / 10:15 UTC)
 
 [Timer]
-OnCalendar=*-*-* 00,06,12,18:02:00 UTC
+OnCalendar=Mon..Fri *-*-* 10:15:00 UTC
 Persistent=true
 Unit=kotak-mcx-advisor.service
 

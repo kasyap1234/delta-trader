@@ -4,6 +4,7 @@ Matches Config C (Max Aggression) for the INR commodity sleeve:
   - MCX GOLDPETAL (1g Gold Futures, Long + Short): 6H Donchian(20) + EMA(50/200) + 3.0x ATR(14) trail
   - NSE SILVERBEES.NS (Spot Silver ETF, Long-Only): 6H/1D Donchian(20) + EMA(50/200) + 3.0x ATR(14) trail
   - Risk: 2.5% per trade, 8.0% max concurrent risk, Winner Pyramiding (+0.5x @ +1.5R), 15% Drawdown Brake.
+  - Data: Native INR MCX/NSE candles via Upstox V3 (default) or optional COMEX Yahoo proxy (--data-source yfinance).
 
 Generates exact whole-lot Kotak Neo order tickets + Telegram alerts + monthly MCX expiry rollover reminders.
 Tracks manually confirmed fills in persistent JSON state (kotak_mcx_state.json).
@@ -26,8 +27,8 @@ import pandas as pd
 import requests
 
 from config import KotakMcxConfig
-from data_loader import load_yfinance
-from portfolio_engine import add_donchian_features
+from data_loader import drop_unclosed_bars, load_upstox, load_yfinance
+from portfolio_engine import add_donchian_features, select_rotation_targets
 
 log = logging.getLogger("KotakMcxAdvisor")
 
@@ -35,6 +36,8 @@ GRAMS_PER_TROY_OZ = 31.1035
 
 ASSETS = {
     "GOLDPETAL": {
+        "upstox_symbol": "GOLDPETAL",
+        "upstox_exchange": "MCX",
         "proxy": "GC=F",
         "broker_segment": "MCX",
         "long_only": False,
@@ -43,6 +46,8 @@ ASSETS = {
         "usd_oz_to_unit": 1.0 / GRAMS_PER_TROY_OZ,
     },
     "SILVERBEES.NS": {
+        "upstox_symbol": "SILVERBEES",
+        "upstox_exchange": "NSE",
         "proxy": "SI=F",
         "broker_segment": "NSE_EQ",
         "long_only": True,
@@ -118,8 +123,20 @@ class KotakMcxAdvisor:
             os.fsync(f.fileno())
         tmp.replace(path)
 
-    def _update_dd_brake(self) -> tuple[float, float, float]:
+    def _mtm_equity(self, mark_prices: Optional[Dict[str, float]] = None) -> float:
         eq = float(self.state["equity_inr"])
+        if not mark_prices:
+            return eq
+        unrealized = 0.0
+        for sym, pos in self.state["positions"].items():
+            px = mark_prices.get(sym)
+            if px is not None and math.isfinite(px) and px > 0:
+                sign = 1 if pos["side"] == "LONG" else -1
+                unrealized += (px - float(pos["entry_inr"])) * sign * int(pos["qty"])
+        return eq + unrealized
+
+    def _update_dd_brake(self, mark_prices: Optional[Dict[str, float]] = None) -> tuple[float, float, float]:
+        eq = self._mtm_equity(mark_prices)
         peak = max(float(self.state.get("peak_equity_inr", eq)), eq)
         self.state["peak_equity_inr"] = peak
         dd = (peak - eq) / peak if peak > 0 else 0.0
@@ -130,6 +147,22 @@ class KotakMcxAdvisor:
                 self.state["dd_brake_active"] = False
         scale = self.cfg.dd_brake_scale if self.state.get("dd_brake_active") else 1.0
         return dd, self.cfg.risk_per_trade_pct * scale, self.cfg.max_concurrent_risk_pct * scale
+
+    def _pyramid_budget_qty(self, sym: str, price_inr: float) -> int:
+        spec = ASSETS[sym]
+        eq = float(self.state["equity_inr"])
+        if eq <= 0 or price_inr <= 0:
+            return 0
+        allocated_margin = sum(
+            float(p["qty"]) * float(p["entry_inr"]) / ASSETS[s]["leverage"]
+            for s, p in self.state["positions"].items()
+            if s in ASSETS
+        )
+        if spec["long_only"]:
+            budget = max(eq - allocated_margin, 0.0)
+            return math.floor(budget / price_inr)
+        budget = max(eq * self.cfg.max_margin_utilization - allocated_margin, 0.0)
+        return math.floor((budget * spec["leverage"]) / price_inr)
 
     def size_order(self, sym: str, price_inr: float, atr_inr: float, risk_pct: float, max_risk_pct: float) -> Dict[str, Any]:
         spec = ASSETS[sym]
@@ -175,7 +208,7 @@ class KotakMcxAdvisor:
         }
 
     def _log_journal(self, row: Dict[str, Any]) -> None:
-        journal = Path(self.cfg.data_dir) / "kotak_mcx_journal.csv"
+        journal = Path(self.cfg.journal_file)
         journal.parent.mkdir(parents=True, exist_ok=True)
         exists = journal.exists()
         with journal.open("a", newline="", encoding="utf-8") as f:
@@ -184,15 +217,64 @@ class KotakMcxAdvisor:
                 writer.writeheader()
             writer.writerow(row)
 
-    def evaluate_symbol(self, sym: str, df_proxy: pd.DataFrame, fx_rate: float, paper_auto: bool = False) -> str:
+    def _log_equity_snapshot(
+        self,
+        bar_date: str,
+        mtm_eq: float,
+        peak_eq: float,
+        dd: float,
+        idle_cash: float,
+    ) -> None:
+        """Appends one daily MTM equity snapshot per NSE bar_date to kotak_rotation_equity.csv."""
+        eq_path = Path(self.cfg.data_dir) / "kotak_rotation_equity.csv"
+        eq_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.state.get("last_equity_log_bar") == bar_date and eq_path.exists():
+            return
+        cash_eq = float(self.state["equity_inr"])
+        open_str = ";".join(
+            f"{s}:{p['qty']}@{float(p['entry_inr']):.2f}"
+            for s, p in sorted(self.state["positions"].items())
+        ) or "FLAT"
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "bar_date": bar_date,
+            "cash_equity_inr": round(cash_eq, 2),
+            "unrealized_pnl_inr": round(mtm_eq - cash_eq, 2),
+            "mtm_equity_inr": round(mtm_eq, 2),
+            "peak_equity_inr": round(peak_eq, 2),
+            "drawdown_pct": round(dd * 100.0, 2),
+            "idle_cash_inr": round(idle_cash, 2),
+            "open_positions": open_str,
+        }
+        exists = eq_path.exists()
+        with eq_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+        self.state["last_equity_log_bar"] = bar_date
+
+    def evaluate_symbol(
+        self,
+        sym: str,
+        df_raw: pd.DataFrame,
+        fx_rate: Optional[float] = None,
+        paper_auto: bool = False,
+        native_inr: Optional[bool] = None,
+        now: Optional[pd.Timestamp] = None,
+        mark_prices: Optional[Dict[str, float]] = None,
+    ) -> str:
         spec = ASSETS[sym]
-        feat = add_donchian_features(df_proxy, entry_len=self.cfg.donchian_entry_len, warmup_bars=self.cfg.ema_slow)
+        is_native = (self.cfg.data_source == "upstox") if native_inr is None else native_inr
+        df_closed = drop_unclosed_bars(df_raw, self.cfg.resolution, now=now)
+        feat = add_donchian_features(df_closed, entry_len=self.cfg.donchian_entry_len, warmup_bars=self.cfg.ema_slow)
         if feat.empty:
-            return f"{sym}: insufficient history after {self.cfg.ema_slow}-bar warmup"
+            return f"{sym}: insufficient closed-bar history after {self.cfg.ema_slow}-bar warmup"
 
         closed = feat.iloc[-1]
         bar_ts = feat.index[-1].isoformat()
-        conv = spec["usd_oz_to_unit"] * fx_rate
+        eff_fx = self.cfg.usd_inr_rate if fx_rate is None else fx_rate
+        conv = 1.0 if is_native else spec["usd_oz_to_unit"] * eff_fx
         close_inr = float(closed["close"]) * conv
         high_inr = float(closed["high"]) * conv
         low_inr = float(closed["low"]) * conv
@@ -203,7 +285,9 @@ class KotakMcxAdvisor:
         dc_hi = float(closed["donchian_high"])
         dc_lo = float(closed["donchian_low"])
 
-        dd, eff_risk, eff_max_risk = self._update_dd_brake()
+        marks = dict(mark_prices or {})
+        marks[sym] = close_inr
+        dd, eff_risk, eff_max_risk = self._update_dd_brake(marks)
         pos = self.state["positions"].get(sym)
 
         if pos is not None:
@@ -221,26 +305,23 @@ class KotakMcxAdvisor:
                     lines.append(f"  PAPER EXIT (STOP HIT): Closed @ Rs {exit_px:,.2f} | Net PnL: Rs {pnl:+,.2f} | Equity: Rs {self.state['equity_inr']:,.2f}")
                     return "\n".join(lines)
                 lines.append(f"  ACTION: STOP HIT -> Close {pos['qty']} {spec['unit_label']} on Kotak Neo and run --record-exit {sym} <fill_px>")
-            elif (new_sl - old_sl) * sign > 0 and (close_inr - new_sl) * sign > 0:
-                pos["sl_inr"] = new_sl
-                self.save_state()
-                lines.append(f"  ACTION: TRAIL SL -> Move Kotak Neo SL from Rs {old_sl:,.2f} to Rs {new_sl:,.2f}")
-            else:
-                lines.append("  ACTION: HOLD (SL unchanged)")
+                return "\n".join(lines)
 
-            # Check Winner Pyramid trigger (+1.5R and stop >= breakeven)
+            # Check Winner Pyramid trigger (+1.5R and prior stop >= breakeven) before trailing stop on this bar.
             init_entry = float(pos.get("init_entry_inr", pos["entry_inr"]))
             init_sl_dist = float(pos.get("init_sl_dist_inr", self.cfg.atr_trail_mult * atr_inr))
-            cur_sl = float(pos["sl_inr"])
-            be_ok = (cur_sl - init_entry) * sign >= 0
+            be_ok = (old_sl - init_entry) * sign >= 0
             move = (close_inr - init_entry) * sign
             if (
                 self.cfg.pyramid_add_fraction > 0
                 and not pos.get("pyramided")
+                and init_sl_dist > 0
                 and be_ok
                 and move >= self.cfg.pyramid_trigger_r * init_sl_dist
             ):
-                add_qty = math.floor(int(pos["qty"]) * self.cfg.pyramid_add_fraction)
+                raw_add = math.floor(int(pos["qty"]) * self.cfg.pyramid_add_fraction)
+                budget_cap = self._pyramid_budget_qty(sym, close_inr)
+                add_qty = min(raw_add, budget_cap)
                 if add_qty >= 1:
                     if paper_auto:
                         fill_px = round(close_inr * (1 + 0.0005 if sign > 0 else 1 - 0.0005), 2)
@@ -251,9 +332,16 @@ class KotakMcxAdvisor:
                     else:
                         lines.append(
                             f"  PYRAMID TRIGGER (+{move/init_sl_dist:.2f}R, SL>=BE): Add +{add_qty} {spec['unit_label']} "
-                            f"at ~Rs {close_inr:,.2f}, update total SL qty to {int(pos['qty']) + add_qty} @ Rs {cur_sl:,.2f}, "
+                            f"at ~Rs {close_inr:,.2f}, update total SL qty to {int(pos['qty']) + add_qty} @ Rs {old_sl:,.2f}, "
                             f"then run --record-pyramid {sym} {add_qty} <fill_px>"
                         )
+
+            if (new_sl - old_sl) * sign > 0 and (close_inr - new_sl) * sign > 0:
+                pos["sl_inr"] = new_sl
+                self.save_state()
+                lines.append(f"  ACTION: TRAIL SL -> Move Kotak Neo SL from Rs {old_sl:,.2f} to Rs {new_sl:,.2f}")
+            else:
+                lines.append("  ACTION: HOLD (SL unchanged)")
             return "\n".join(lines)
 
         last_bars = self.state.setdefault("last_entry_bar", {})
@@ -288,47 +376,273 @@ class KotakMcxAdvisor:
                 f"[{spec['broker_segment']}] PAPER ENTRY: {side} {sym} x {sized['qty']} {spec['unit_label']} @ Rs {fill_inr:,.2f}",
                 f"  Initial SL: Rs {sl_inr:,.2f} ({self.cfg.atr_trail_mult:.1f}x ATR) | Risk: Rs {sized['risk_inr']:,.0f} ({sized['risk_pct']*100:.2f}%)",
             ])
+        px_note = "Upstox INR" if is_native else f"Proxy FX={eff_fx:.2f}"
         return "\n".join([
             f"[{spec['broker_segment']}] ENTRY SIGNAL: {side} {sym} x {sized['qty']} {spec['unit_label']}",
-            f"  Est Price : Rs {close_inr:,.2f} (FX={fx_rate:.2f}) | Initial SL: Rs {sl_inr:,.2f} ({self.cfg.atr_trail_mult:.1f}x ATR)",
+            f"  Est Price : Rs {close_inr:,.2f} ({px_note}) | Initial SL: Rs {sl_inr:,.2f} ({self.cfg.atr_trail_mult:.1f}x ATR)",
             f"  Notional  : Rs {sized['notional_inr']:,.0f} | Est Margin: Rs {sized['margin_inr']:,.0f} | Risk: Rs {sized['risk_inr']:,.0f} ({sized['risk_pct']*100:.2f}%)",
             f"  Confirm   : python live_kotak_mcx_advisor.py --record-entry {sym} {side} {sized['qty']} <fill_px> {sl_inr}",
         ])
 
-    def run_once(self, fx_override: Optional[float] = None, paper_auto: bool = False) -> str:
-        fx = fx_override if fx_override is not None else fetch_usd_inr(self.cfg.usd_inr_rate)
-        dd, eff_risk, eff_max_risk = self._update_dd_brake()
+    def _load_asset_candles(self, sym: str) -> pd.DataFrame:
+        spec = ASSETS[sym]
+        if self.cfg.data_source == "upstox":
+            return load_upstox(
+                spec["upstox_symbol"],
+                interval=self.cfg.resolution,
+                days=180,
+                exchange=spec["upstox_exchange"],
+                include_warmup=True,
+                include_intraday=True,
+            )
+        return load_yfinance(spec["proxy"], interval=self.cfg.resolution, days=180, include_warmup=True)
+
+    def _closed_nse_daily_bars(self, df: pd.DataFrame, now: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+        """Keeps NSE daily bars that have already closed (NSE closes at 15:30 IST)."""
+        if df.empty:
+            return df
+        now_ist = (
+            pd.Timestamp.now(tz="Asia/Kolkata")
+            if now is None
+            else (pd.Timestamp(now).tz_localize("Asia/Kolkata") if pd.Timestamp(now).tzinfo is None else pd.Timestamp(now).tz_convert("Asia/Kolkata"))
+        )
+        today_bucket = now_ist.normalize()
+        nse_closed_today = (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 30)
+        if nse_closed_today:
+            return df.loc[df.index <= today_bucket]
+        return df.loc[df.index < today_bucket]
+
+    def _load_rotation_candles(self, sym: str) -> pd.DataFrame:
+        if self.cfg.data_source == "upstox":
+            return load_upstox(
+                sym,
+                interval="1d",
+                days=160,
+                exchange="NSE",
+                include_warmup=False,
+                include_intraday=False,
+            )
+        yf_sym = sym if sym.endswith(".NS") else f"{sym}.NS"
+        return load_yfinance(yf_sym, interval="1d", days=160, include_warmup=False)
+
+    def _run_rotation_once(self, paper_auto: bool = False, now: Optional[pd.Timestamp] = None) -> str:
+        """All-6 Top-2 Dual-Momentum Vol-Parity NSE ETF Rotation + LIQUIDBEES cash sweep."""
+        closed_dfs: Dict[str, pd.DataFrame] = {}
+        load_errors: Dict[str, str] = {}
+        for sym in self.cfg.rotation_symbols:
+            try:
+                df = self._load_rotation_candles(sym)
+                closed_dfs[sym] = self._closed_nse_daily_bars(df, now=now)
+            except Exception as exc:
+                load_errors[sym] = str(exc)
+
+        sel = select_rotation_targets(closed_dfs, top_k=self.cfg.rotation_top_k)
+        prices: Dict[str, float] = sel["prices"]
+        chosen: list = sel["chosen"]
+        weights: Dict[str, float] = sel["weights"]
+        cash_weight: float = float(sel["cash_weight"])
+        latest_bar = sel["latest_bar"]
+        latest_bar_str = latest_bar.strftime("%Y-%m-%d") if latest_bar is not None else None
+
+        mtm_eq = self._mtm_equity(prices)
+        peak = max(float(self.state.get("peak_equity_inr", mtm_eq)), mtm_eq)
+        self.state["peak_equity_inr"] = peak
+        dd = (peak - mtm_eq) / peak if peak > 0 else 0.0
+
+        # Track NSE trading days elapsed since last rebalance (idempotent on same-day reruns).
+        prev_eval = self.state.get("last_eval_bar")
+        bars_since = int(self.state.get("bars_since_rebal", 0))
+        if latest_bar_str and latest_bar_str != prev_eval:
+            if prev_eval is not None:
+                bars_since += 1
+            self.state["last_eval_bar"] = latest_bar_str
+            self.state["bars_since_rebal"] = bars_since
+
+        rebal_due = (
+            latest_bar_str is not None
+            and not load_errors
+            and (
+                self.state.get("last_rebal_bar") is None
+                or bars_since >= self.cfg.rotation_rebal_days
+            )
+        )
+
         mode_tag = "PAPER-AUTO" if paper_auto else "ADVISOR"
+        src_tag = "UPSTOX (Native INR)" if self.cfg.data_source == "upstox" else "YFINANCE (NSE .NS)"
         header = (
-            f"KOTAK NEO MCX/ETF {mode_tag} ({self.cfg.resolution.upper()}) | "
-            f"Equity=Rs {self.state['equity_inr']:,.0f} | Peak=Rs {self.state['peak_equity_inr']:,.0f} | "
-            f"DD={dd*100:.1f}% | Risk={eff_risk*100:.2f}%/{eff_max_risk*100:.1f}% | USDINR={fx:.2f}"
+            f"KOTAK NEO ALL-6 ROTATION {mode_tag} (1D) | Source={src_tag} | "
+            f"Bar={latest_bar_str or 'N/A'} | Equity=Rs {mtm_eq:,.0f} | Peak=Rs {peak:,.0f} | DD={dd*100:.1f}%"
+        )
+        blocks = [header]
+
+        for sym, err in load_errors.items():
+            blocks.append(f"[NSE_EQ] {sym} ERROR: {err}")
+
+        rank_lines = ["Rankings (0.5*21d + 0.5*60d, requires Mom>0 & Close>EMA50):"]
+        for r in sel["rankings"]:
+            flag = "PICK" if r["symbol"] in chosen else ("QUAL" if r["qualified"] else "SKIP")
+            w_str = f" | W={weights[r['symbol']]*100:.1f}%" if r["symbol"] in weights else ""
+            rank_lines.append(
+                f"  [{flag:4s}] {r['symbol']:10s} | Px=Rs {r['close']:7.2f} | EMA50={r['ema50']:7.2f} | "
+                f"Mom={r['momentum']*100:+6.2f}% | Vol={r['vol_ann']*100:4.1f}%{w_str}"
+            )
+        rank_lines.append(f"  [CASH] {self.cfg.rotation_cash_symbol:10s} | Target Cash Weight={cash_weight*100:.1f}%")
+        blocks.append("\n".join(rank_lines))
+
+        actions = []
+        if rebal_due:
+            chosen_set = set(chosen)
+            # 1. Exit open holdings that dropped out of Top-K
+            for sym, pos in list(self.state["positions"].items()):
+                if sym not in chosen_set and sym in prices:
+                    px = prices[sym]
+                    if paper_auto:
+                        ex_px = round(px * (1.0 - 0.0005), 2)
+                        fees = round(ex_px * int(pos["qty"]) * 0.0005, 2)
+                        pnl = self.record_exit(sym, ex_px, fees_inr=fees)
+                        actions.append(f"PAPER SELL {sym} x{pos['qty']} @ Rs {ex_px:,.2f} | Net PnL: Rs {pnl:+,.2f}")
+                    else:
+                        actions.append(
+                            f"ACTION: SELL {sym} x{pos['qty']} @ ~Rs {px:,.2f} -> Confirm: "
+                            f"python live_kotak_mcx_advisor.py --strategy rotation --record-exit {sym} <fill_px>"
+                        )
+
+            # Recompute MTM equity after exits
+            mtm_eq = self._mtm_equity(prices)
+            # 2. Enter newly selected Top-K winners (keep existing winners untouched to minimize turnover)
+            planned_buy_inr = 0.0
+            for sym in chosen:
+                if sym in self.state["positions"]:
+                    pos = self.state["positions"][sym]
+                    actions.append(f"HOLD {sym} x{pos['qty']} (still in Top-{self.cfg.rotation_top_k}, Px=Rs {prices[sym]:,.2f})")
+                    continue
+                px = prices[sym]
+                allocated = sum(int(p["qty"]) * float(p["entry_inr"]) for p in self.state["positions"].values()) + planned_buy_inr
+                free_cash = max(float(self.state["equity_inr"]) - allocated, 0.0)
+                budget = min(mtm_eq * weights[sym], free_cash)
+                entry_est = round(px * (1.0 + 0.0005), 2)
+                qty = math.floor(budget / entry_est)
+                if qty >= 1:
+                    if paper_auto:
+                        self.record_entry(sym, "LONG", qty, entry_est, 0.0)
+                        buy_fees = round(entry_est * qty * 0.0005, 2)
+                        self._log_journal({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "action": "BUY",
+                            "symbol": sym,
+                            "side": "LONG",
+                            "qty": qty,
+                            "entry_inr": round(entry_est, 2),
+                            "exit_inr": "",
+                            "fees_inr": buy_fees,
+                            "pnl_inr": 0.0,
+                            "equity_inr": round(float(self.state["equity_inr"]), 2),
+                        })
+                        actions.append(
+                            f"PAPER BUY {sym} x{qty} @ Rs {entry_est:,.2f} (Notional Rs {qty*entry_est:,.0f}, W={weights[sym]*100:.1f}%)"
+                        )
+                    else:
+                        planned_buy_inr += qty * px
+                        actions.append(
+                            f"ACTION: BUY {sym} x{qty} @ ~Rs {px:,.2f} (Notional Rs {qty*px:,.0f}, W={weights[sym]*100:.1f}%) -> Confirm: "
+                            f"python live_kotak_mcx_advisor.py --strategy rotation --record-entry {sym} LONG {qty} <fill_px> 0"
+                        )
+
+            allocated = sum(int(p["qty"]) * float(p["entry_inr"]) for p in self.state["positions"].values()) + planned_buy_inr
+            idle_cash = max(float(self.state["equity_inr"]) - allocated, 0.0)
+            liq_units = math.floor(idle_cash / 1000.0)
+            actions.append(f"CASH SWEEP: Park ~Rs {idle_cash:,.0f} (~{liq_units} units) in {self.cfg.rotation_cash_symbol}")
+
+            if paper_auto:
+                self.state["last_rebal_bar"] = latest_bar_str
+                self.state["bars_since_rebal"] = 0
+        else:
+            days_left = max(self.cfg.rotation_rebal_days - bars_since, 0)
+            held = ", ".join(f"{s} x{p['qty']}" for s, p in self.state["positions"].items()) or "NONE (100% LIQUIDBEES)"
+            actions.append(f"HOLD (Next rebalance in {days_left} trading day(s)) | Open: {held}")
+
+        blocks.append("\n".join(actions))
+        if paper_auto and latest_bar_str:
+            alloc_now = sum(int(p["qty"]) * float(p["entry_inr"]) for p in self.state["positions"].values())
+            idle_now = max(float(self.state["equity_inr"]) - alloc_now, 0.0)
+            mtm_after = self._mtm_equity(prices)
+            peak_after = max(float(self.state.get("peak_equity_inr", mtm_after)), mtm_after)
+            self.state["peak_equity_inr"] = peak_after
+            dd_after = (peak_after - mtm_after) / peak_after if peak_after > 0 else 0.0
+            self._log_equity_snapshot(latest_bar_str, mtm_after, peak_after, dd_after, idle_now)
+        self.save_state()
+        report = "\n\n".join(blocks)
+        if any(k in report for k in ("ACTION: BUY", "ACTION: SELL", "PAPER BUY", "PAPER SELL", "ERROR:")):
+            send_telegram(self.cfg, report)
+        return report
+
+    def run_once(self, fx_override: Optional[float] = None, paper_auto: bool = False, now: Optional[pd.Timestamp] = None) -> str:
+        if self.cfg.strategy_mode == "rotation":
+            return self._run_rotation_once(paper_auto=paper_auto, now=now)
+        is_native = self.cfg.data_source == "upstox"
+        fx = None if is_native else (fx_override if fx_override is not None else fetch_usd_inr(self.cfg.usd_inr_rate))
+        loaded: Dict[str, pd.DataFrame] = {}
+        load_errors: Dict[str, str] = {}
+        mark_prices: Dict[str, float] = {}
+
+        for sym, spec in ASSETS.items():
+            try:
+                df = self._load_asset_candles(sym)
+                loaded[sym] = df
+                df_closed = drop_unclosed_bars(df, self.cfg.resolution, now=now)
+                if not df_closed.empty:
+                    conv = 1.0 if is_native else spec["usd_oz_to_unit"] * fx
+                    mark_prices[sym] = float(df_closed["close"].iloc[-1]) * conv
+            except Exception as exc:
+                load_errors[sym] = str(exc)
+
+        dd, eff_risk, eff_max_risk = self._update_dd_brake(mark_prices)
+        mtm_eq = self._mtm_equity(mark_prices)
+        mode_tag = "PAPER-AUTO" if paper_auto else "ADVISOR"
+        source_tag = "Source=UPSTOX (Native INR)" if is_native else f"Source=YFINANCE-PROXY | USDINR={fx:.2f}"
+        header = (
+            f"KOTAK NEO MCX/ETF {mode_tag} ({self.cfg.resolution.upper()}) | {source_tag} | "
+            f"Equity=Rs {mtm_eq:,.0f} | Peak=Rs {self.state['peak_equity_inr']:,.0f} | "
+            f"DD={dd*100:.1f}% | Risk={eff_risk*100:.2f}%/{eff_max_risk*100:.1f}%"
         )
         blocks = [header]
         roll = mcx_rollover_warning()
         if roll:
             blocks.append(roll)
         for sym, spec in ASSETS.items():
+            if sym in load_errors:
+                blocks.append(f"[{spec['broker_segment']}] {sym} ERROR: {load_errors[sym]}")
+                continue
             try:
-                df = load_yfinance(spec["proxy"], interval=self.cfg.resolution, days=180, include_warmup=True)
-                blocks.append(self.evaluate_symbol(sym, df, fx, paper_auto=paper_auto))
+                blocks.append(
+                    self.evaluate_symbol(
+                        sym,
+                        loaded[sym],
+                        fx_rate=fx,
+                        paper_auto=paper_auto,
+                        native_inr=is_native,
+                        now=now,
+                        mark_prices=mark_prices,
+                    )
+                )
             except Exception as exc:
                 blocks.append(f"[{spec['broker_segment']}] {sym} ERROR: {exc}")
         self.save_state()
         report = "\n\n".join(blocks)
-        if any(k in report for k in ("ENTRY SIGNAL", "PAPER ENTRY", "PAPER EXIT", "PAPER PYRAMID", "ACTION: TRAIL", "ACTION: STOP HIT", "PYRAMID TRIGGER", "ROLLOVER ALERT")):
+        if any(k in report for k in ("ENTRY SIGNAL", "PAPER ENTRY", "PAPER EXIT", "PAPER PYRAMID", "ACTION: TRAIL", "ACTION: STOP HIT", "PYRAMID TRIGGER", "ROLLOVER ALERT", "ERROR:")):
             send_telegram(self.cfg, report)
         return report
 
     def record_entry(self, sym: str, side: str, qty: int, fill_inr: float, sl_inr: float) -> None:
-        if sym not in ASSETS:
+        is_rotation_sym = self.cfg.strategy_mode == "rotation" and sym in set(self.cfg.rotation_symbols)
+        if sym not in ASSETS and not is_rotation_sym:
             raise ValueError(f"Unsupported symbol: {sym}")
         side = side.upper()
-        if ASSETS[sym]["long_only"] and side != "LONG":
+        if (is_rotation_sym or ASSETS[sym]["long_only"]) and side != "LONG":
             raise ValueError(f"{sym} is long-only")
-        if qty < 1 or fill_inr <= 0 or sl_inr <= 0:
+        if qty < 1 or fill_inr <= 0 or (sl_inr <= 0 and not is_rotation_sym):
             raise ValueError("qty, fill_inr, and sl_inr must be positive")
-        sl_dist = abs(fill_inr - sl_inr)
+        sl_dist = abs(fill_inr - sl_inr) if sl_inr > 0 else 0.0
         risk_inr = qty * sl_dist
         self.state["positions"][sym] = {
             "side": side,
@@ -365,6 +679,7 @@ class KotakMcxAdvisor:
         self.save_state()
         self._log_journal({
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": "SELL",
             "symbol": sym,
             "side": pos["side"],
             "qty": int(pos["qty"]),
@@ -378,11 +693,13 @@ class KotakMcxAdvisor:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kotak Neo MCX GOLDPETAL + NSE SILVERBEES Advisor (Config C)")
+    parser = argparse.ArgumentParser(description="Kotak Neo NSE ETF Rotation / MCX Advisor")
+    parser.add_argument("--strategy", choices=["rotation", "config_c"], default=None, help="Override KOTAK_STRATEGY_MODE (rotation = All-6 Top-2 Vol-Parity + LIQUIDBEES; config_c = 6h GOLDPETAL + SILVERBEES)")
     parser.add_argument("--capital", type=float, default=None, help="Override Kotak INR capital (default: 98000)")
-    parser.add_argument("--usd-inr", type=float, default=None, help="Override USD/INR exchange rate")
+    parser.add_argument("--data-source", choices=["upstox", "yfinance"], default=None, help="Candle source: upstox (native INR, default) or yfinance")
+    parser.add_argument("--usd-inr", type=float, default=None, help="Override USD/INR exchange rate (yfinance proxy mode only)")
     parser.add_argument("--resolution", choices=["4h", "6h", "12h", "1d"], default=None)
-    parser.add_argument("--paper-auto", action="store_true", help="Automatically track paper entries, trails, pyramids, and exits into kotak_mcx_journal.csv")
+    parser.add_argument("--paper-auto", action="store_true", help="Automatically track paper entries, trails, pyramids, and exits into journal CSV")
     parser.add_argument("--status", action="store_true", help="Print stored Kotak Neo advisor state")
     parser.add_argument("--record-entry", nargs=5, metavar=("SYM", "SIDE", "QTY", "FILL_INR", "SL_INR"))
     parser.add_argument("--record-pyramid", nargs=3, metavar=("SYM", "ADD_QTY", "FILL_INR"))
@@ -391,7 +708,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = KotakMcxConfig(
+        **({} if args.strategy is None else {"strategy_mode": args.strategy}),
         **({} if args.capital is None else {"capital_inr": args.capital}),
+        **({} if args.data_source is None else {"data_source": args.data_source}),
         **({} if args.resolution is None else {"resolution": args.resolution}),
     )
     log_path = Path(cfg.data_dir) / "kotak_mcx_advisor.log"

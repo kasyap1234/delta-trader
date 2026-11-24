@@ -1,9 +1,7 @@
 """
-ONE-COMMAND TIMEFRAME PLATEAU & OUT-OF-SAMPLE SWEEP RUNNER
+Compare Donchian portfolio backtests across candle timeframes.
 
-Runs the exact same hardened portfolio across multiple candle timeframes
-(default: 2h, 4h, 6h, 12h, 1d) and prints a side-by-side comparison table
-to verify that the edge is a broad plateau rather than a lucky 4h spike.
+Prints side-by-side results and saves CSV summaries for the requested window.
 """
 
 import argparse
@@ -12,7 +10,8 @@ from typing import List
 import pandas as pd
 
 from data_loader import SUPPORTED_INTERVALS
-from run_hardened_backtest import run_single_backtest
+from research.outputs import new_run_directory
+from research.portfolio_backtest import run_single_backtest
 
 
 def main():
@@ -136,14 +135,15 @@ def main():
     df_d = pd.DataFrame(donchian_rows)
     print(df_d.to_string(index=False))
 
+    output_dir = new_run_directory("timeframe-sweep")
     if combined_rows:
         print("\n================ COMBINED PORTFOLIO (DONCHIAN + SPREADS + 7% YIELD) ================\n")
         df_c = pd.DataFrame(combined_rows)
         print(df_c.to_string(index=False))
-        df_c.to_csv("timeframe_sweep_combined.csv", index=False)
+        df_c.to_csv(output_dir / "combined_summary.csv", index=False)
 
-    df_d.to_csv("timeframe_sweep_donchian.csv", index=False)
-    print("\nSaved: timeframe_sweep_donchian.csv" + (" and timeframe_sweep_combined.csv" if combined_rows else ""))
+    df_d.to_csv(output_dir / "donchian_summary.csv", index=False)
+    print(f"\nSaved timeframe summaries to {output_dir}/")
 
 
 if __name__ == "__main__":

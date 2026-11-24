@@ -11,7 +11,7 @@ DATA_DIR="${APP_DIR}/data"
 echo "==> Setting up trading system in ${APP_DIR} for user ${APP_USER}"
 
 # 1. Add 2 GB swapfile if missing (prevents OOM during pip install on e2-micro 1 GB RAM)
-if ! swapon --show | grep -q '/swapfile'; then
+if ! sudo swapon --show | grep -q '/swapfile'; then
   echo "==> Creating 2 GB swapfile for e2-micro memory headroom..."
   sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
   sudo chmod 600 /swapfile
@@ -20,15 +20,16 @@ if ! swapon --show | grep -q '/swapfile'; then
   grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
 fi
 
-# 2. Install Python venv tooling if absent
-if ! python3 -m venv --help >/dev/null 2>&1; then
+# 2. Install Python venv/ensurepip tooling if absent
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
   sudo apt-get update -y
   sudo apt-get install -y python3-venv python3-pip
 fi
 
 # 3. Create venv and install dependencies
 cd "${APP_DIR}"
-if [ ! -d ".venv" ]; then
+if [ ! -x ".venv/bin/pip" ]; then
+  rm -rf .venv
   python3 -m venv .venv
 fi
 .venv/bin/pip install --upgrade pip

@@ -1,3 +1,5 @@
+"""Backtest Config C, individual sleeves, or the legacy synthetic portfolio."""
+
 import argparse
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +20,7 @@ from portfolio_engine import (
     run_shared_donchian_portfolio,
     run_weekly_credit_spreads,
 )
+from research.outputs import new_run_directory
 
 
 def calc_curve_stats(name: str, equity_curve: pd.Series, trades: List[PortfolioTrade], initial_capital: float, rf_apr: float = 0.0) -> Dict[str, Any]:
@@ -103,6 +106,7 @@ def run_single_backtest(
     dd_brake: Optional[float] = 0.15,
     spread_share: float = 0.5,
     crypto_source: str = "binance",
+    commodity_source: str = "yfinance",
     crypto_syms: Optional[List[str]] = None,
     commodities: Optional[List[str]] = None,
     gold_etf: bool = False,
@@ -170,9 +174,16 @@ def run_single_backtest(
             asset_dfs[sym] = load_binance(sym, interval=interval, days=days, start_date=start_date, end_date=end_date)
 
     for sym in commodities:
-        if verbose:
-            print(f"  [Yahoo Finance] {sym}...")
-        asset_dfs[sym] = load_yfinance(sym, interval=interval, days=days, start_date=start_date, end_date=end_date)
+        if commodity_source == "upstox":
+            sym_u = sym.upper().replace(".NS", "")
+            exch = "MCX" if sym_u.startswith(("GOLD", "SILVERM", "SILVERMIC", "CRUDE")) and not sym_u.endswith(("BEES", "IETF", "CASE")) else "NSE"
+            if verbose:
+                print(f"  [Upstox V3 {exch}] {sym}...")
+            asset_dfs[sym] = load_upstox(sym, interval=interval, days=days, exchange=exch, start_date=start_date, end_date=end_date)
+        else:
+            if verbose:
+                print(f"  [Yahoo Finance] {sym}...")
+            asset_dfs[sym] = load_yfinance(sym, interval=interval, days=days, start_date=start_date, end_date=end_date)
 
     donchian_trades, donchian_eq, diag = run_shared_donchian_portfolio(
         asset_dfs, crypto_set, cfg, eval_start=eval_start_ist, eval_end=eval_end_ist
@@ -251,6 +262,7 @@ def run_two_broker_backtest(
     kotak_capital_inr: float = 98_000.0,
     usd_inr_rate: float = 85.0,
     crypto_source: str = "delta",
+    kotak_source: str = "upstox",
     maker_entry: bool = True,
     pyramid_add: float = 0.5,
     dd_brake: Optional[float] = 0.15,
@@ -269,21 +281,43 @@ def run_two_broker_backtest(
         crypto_syms=delta_syms, crypto_only=True, whole_lots=True, verbose=verbose,
     )
 
-    mcx_interval = "1d" if start_date else interval
-    _, _, eval_start_ist, eval_end_ist = resolve_date_window(mcx_interval, days, start_date, end_date, include_warmup=True)
-    mcx_dfs = {
-        "GC=F": load_yfinance("GC=F", interval=mcx_interval, days=days, start_date=start_date, end_date=end_date),
-        "SI=F": load_yfinance("SI=F", interval=mcx_interval, days=days, start_date=start_date, end_date=end_date),
-    }
-    mcx_cfg = PortfolioConfig(
-        initial_capital=kotak_capital_inr, usd_inr_rate=usd_inr_rate,
-        donchian_risk_per_trade_pct=0.025, max_concurrent_risk_pct=0.08,
-        atr_trail_mult=3.0, slippage_pct=0.0005, entry_slippage_pct=0.0005,
-        max_leverage=8.0, max_margin_utilization=0.75,
-        pyramid_add_fraction=pyramid_add, dd_brake_threshold=dd_brake,
-        whole_lot_rounding=True, enable_credit_spreads=False,
-        long_only_assets={"SI=F"},
-    )
+    if kotak_source == "upstox":
+        mcx_interval = interval
+        _, _, eval_start_ist, eval_end_ist = resolve_date_window(mcx_interval, days, start_date, end_date, include_warmup=True)
+        if verbose:
+            print("  [Upstox V3 MCX] GOLDPETAL (native INR)...")
+            print("  [Upstox V3 NSE] SILVERBEES (native INR)...")
+        mcx_dfs = {
+            "GOLDPETAL": load_upstox("GOLDPETAL", interval=mcx_interval, days=days, exchange="MCX", start_date=start_date, end_date=end_date),
+            "SILVERBEES": load_upstox("SILVERBEES", interval=mcx_interval, days=days, exchange="NSE", start_date=start_date, end_date=end_date),
+        }
+        mcx_cfg = PortfolioConfig(
+            initial_capital=kotak_capital_inr, usd_inr_rate=1.0,
+            donchian_risk_per_trade_pct=0.025, max_concurrent_risk_pct=0.08,
+            atr_trail_mult=3.0, slippage_pct=0.0005, entry_slippage_pct=0.0005,
+            max_leverage=8.0, max_margin_utilization=0.75,
+            pyramid_add_fraction=pyramid_add, dd_brake_threshold=dd_brake,
+            whole_lot_rounding=True, enable_credit_spreads=False,
+            long_only_assets={"SILVERBEES"},
+        )
+        kotak_label = "Sleeve 2: Kotak Neo (Upstox MCX GOLDPETAL + NSE SILVERBEES)"
+    else:
+        mcx_interval = "1d" if start_date else interval
+        _, _, eval_start_ist, eval_end_ist = resolve_date_window(mcx_interval, days, start_date, end_date, include_warmup=True)
+        mcx_dfs = {
+            "GC=F": load_yfinance("GC=F", interval=mcx_interval, days=days, start_date=start_date, end_date=end_date),
+            "SI=F": load_yfinance("SI=F", interval=mcx_interval, days=days, start_date=start_date, end_date=end_date),
+        }
+        mcx_cfg = PortfolioConfig(
+            initial_capital=kotak_capital_inr, usd_inr_rate=usd_inr_rate,
+            donchian_risk_per_trade_pct=0.025, max_concurrent_risk_pct=0.08,
+            atr_trail_mult=3.0, slippage_pct=0.0005, entry_slippage_pct=0.0005,
+            max_leverage=8.0, max_margin_utilization=0.75,
+            pyramid_add_fraction=pyramid_add, dd_brake_threshold=dd_brake,
+            whole_lot_rounding=True, enable_credit_spreads=False,
+            long_only_assets={"SI=F"},
+        )
+        kotak_label = "Sleeve 2: Kotak Neo (Proxy GC=F + SI=F)"
     mcx_trades, mcx_eq, mcx_diag = run_shared_donchian_portfolio(
         mcx_dfs, set(), mcx_cfg, eval_start=eval_start_ist, eval_end=eval_end_ist
     )
@@ -300,12 +334,13 @@ def run_two_broker_backtest(
         "common_idx": common_idx,
         "total_init_inr": total_init_inr,
         "corr": float(corr) if pd.notna(corr) else 0.0,
+        "kotak_source": kotak_source,
         "delta_res": delta_res,
         "mcx_trades": mcx_trades,
         "mcx_diag": mcx_diag,
         "stats": {
             "delta": delta_res["stats"]["donchian"],
-            "kotak": calc_curve_stats("Sleeve 2: Kotak Neo (GOLDPETAL + SILVERBEES)", m_aligned, mcx_trades, kotak_capital_inr),
+            "kotak": calc_curve_stats(kotak_label, m_aligned, mcx_trades, kotak_capital_inr),
             "combined": calc_curve_stats("COMBINED (Rs 2L Two-Broker, Zero Double-Count)", combined_eq, delta_res["donchian_trades"] + mcx_trades, total_init_inr),
         },
         "equity_df": pd.DataFrame({
@@ -337,6 +372,8 @@ def main():
     parser.add_argument("--spread-share", type=float, default=0.5, help="Capital weight for Engine B in combined stats (default: 0.5)")
     parser.add_argument("--enable-spreads", action="store_true", help="Include legacy synthetic Engine B Nifty spreads")
     parser.add_argument("--crypto-source", choices=["binance", "delta"], default="binance", help="Crypto candle source")
+    parser.add_argument("--kotak-source", choices=["upstox", "yfinance"], default="upstox", help="Sleeve 2 candle source in --two-broker mode (default: upstox native INR)")
+    parser.add_argument("--commodity-source", choices=["yfinance", "upstox"], default="yfinance", help="Commodity candle source in single-portfolio mode")
     parser.add_argument("--crypto", nargs="+", default=["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"], help="Crypto symbols")
     parser.add_argument("--commodities", nargs="*", default=["GC=F"], help="Commodity/ETF symbols (default: GC=F)")
     parser.add_argument("--gold-etf", action="store_true", help="Replace GC=F with long-only GOLDIETF.NS")
@@ -353,18 +390,21 @@ def main():
         src = "binance" if args.start else ("delta" if args.crypto_source == "binance" else args.crypto_source)
         tb = run_two_broker_backtest(
             interval=args.interval, days=args.days, start_date=args.start, end_date=args.end,
-            usd_inr_rate=args.usd_inr, crypto_source=src, maker_entry=args.maker or args.entry_slippage is None,
+            usd_inr_rate=args.usd_inr, crypto_source=src, kotak_source=args.kotak_source,
+            maker_entry=args.maker or args.entry_slippage is None,
             pyramid_add=args.pyramid, dd_brake=dd_brake, verbose=True,
         )
         idx = tb["common_idx"]
         print(f"\n================ TWO-BROKER CONFIG C SUMMARY ({idx[0].date()} -> {idx[-1].date()}) ================")
-        print(f"Total Capital: Rs {tb['total_init_inr']:,.0f} ($1,200 Delta + Rs 98,000 Kotak Neo) | Sleeve Corr: {tb['corr']:+.2f}\n")
+        print(f"Total Capital: Rs {tb['total_init_inr']:,.0f} ($1,200 Delta + Rs 98,000 Kotak Neo) | Kotak Source: {tb['kotak_source'].upper()} | Sleeve Corr: {tb['corr']:+.2f}\n")
         print(pd.DataFrame([tb["stats"]["delta"], tb["stats"]["kotak"], tb["stats"]["combined"]]).to_string(index=False))
         yr_end = tb["equity_df"]["combined_equity_inr"].resample("YE").last()
         yr_ret = yr_end.pct_change()
         yr_ret.iloc[0] = yr_end.iloc[0] / tb["total_init_inr"] - 1.0
         print("\nAnnual Combined Return: " + " | ".join(f"{d.year}: {v*100:+.1f}%" for d, v in yr_ret.items()))
-        tb["equity_df"].to_csv("hardened_equity_curve.csv")
+        equity_path = new_run_directory("config-c") / "equity_curve.csv"
+        tb["equity_df"].to_csv(equity_path)
+        print(f"\nSaved: {equity_path}")
         return
 
     entry_slip = 0.0004 if args.maker else args.entry_slippage
@@ -396,6 +436,7 @@ def main():
         dd_brake=dd_brake,
         spread_share=args.spread_share,
         crypto_source=args.crypto_source,
+        commodity_source=args.commodity_source,
         crypto_syms=args.crypto,
         commodities=args.commodities,
         gold_etf=args.gold_etf,
@@ -449,9 +490,10 @@ def main():
         top3 = sum(d_pnls[:3])
         print(f"\nDonchian Top-3 Trades Share: {ccy} {top3:,.2f} / {ccy} {tot_d:,.2f} ({(top3/tot_d*100) if tot_d else 0:.1f}%) | Ex-Top-3: {ccy} {tot_d - top3:,.2f}")
 
-    pd.DataFrame([t.__dict__ for t in all_trades]).to_csv("hardened_trades.csv", index=False)
-    res["equity_df"].to_csv("hardened_equity_curve.csv")
-    print("\nSaved: hardened_trades.csv and hardened_equity_curve.csv")
+    output_dir = new_run_directory("portfolio-backtest")
+    pd.DataFrame([t.__dict__ for t in all_trades]).to_csv(output_dir / "trades.csv", index=False)
+    res["equity_df"].to_csv(output_dir / "equity_curve.csv")
+    print(f"\nSaved trades and equity curve to {output_dir}/")
 
 
 if __name__ == "__main__":

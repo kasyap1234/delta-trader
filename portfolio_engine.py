@@ -69,6 +69,150 @@ def add_donchian_features(
     return df
 
 
+def add_3pod_features(
+    df: pd.DataFrame,
+    entry_len: int = 20,
+    warmup_bars: int = 240,
+    st_period: int = 10,
+    st_mult: float = 3.0,
+    adx_period: int = 14,
+) -> pd.DataFrame:
+    """
+    Computes shared indicators for the 3-Pod Crypto Engine:
+      - Pod 1 (Donchian): ema50, ema200, atr14, donchian_high, donchian_low
+      - Pod 2 (Supertrend+ADX): st_dir, st_line, adx14
+      - Pod 3 (CTA TSMOM Vol-Target): vol28 (annualized), ret_7d, ret_21d, ret_60d
+    """
+    f = add_ema_atr_features(df)
+    f["donchian_high"] = f["high"].rolling(entry_len).max().shift(1)
+    f["donchian_low"] = f["low"].rolling(entry_len).min().shift(1)
+    f["vol_ma20"] = f["volume"].rolling(entry_len).mean().shift(1)
+
+    # ADX(14)
+    up_move = f["high"].diff()
+    down_move = -f["low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    prev_close = f["close"].shift(1)
+    tr = pd.concat(
+        [f["high"] - f["low"], (f["high"] - prev_close).abs(), (f["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr_adx = tr.ewm(alpha=1.0 / adx_period, adjust=False).mean()
+    plus_di = 100.0 * pd.Series(plus_dm, index=f.index).ewm(alpha=1.0 / adx_period, adjust=False).mean() / atr_adx.replace(0, np.nan)
+    minus_di = 100.0 * pd.Series(minus_dm, index=f.index).ewm(alpha=1.0 / adx_period, adjust=False).mean() / atr_adx.replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    f["adx14"] = dx.ewm(alpha=1.0 / adx_period, adjust=False).mean()
+
+    # Supertrend(10, 3.0)
+    atr_st = tr.ewm(alpha=1.0 / st_period, adjust=False).mean()
+    hl2 = (f["high"] + f["low"]) / 2.0
+    final_u = (hl2 + st_mult * atr_st).to_numpy().copy()
+    final_l = (hl2 - st_mult * atr_st).to_numpy().copy()
+    close_arr = f["close"].to_numpy()
+    st_dir = np.ones(len(f), dtype=int)
+    for i in range(1, len(f)):
+        if not (math.isfinite(final_u[i]) and math.isfinite(final_l[i])):
+            st_dir[i] = st_dir[i - 1]
+            continue
+        if close_arr[i - 1] <= final_u[i - 1]:
+            final_u[i] = min(final_u[i], final_u[i - 1])
+        if close_arr[i - 1] >= final_l[i - 1]:
+            final_l[i] = max(final_l[i], final_l[i - 1])
+        if st_dir[i - 1] == 1:
+            st_dir[i] = -1 if close_arr[i] < final_l[i] else 1
+        else:
+            st_dir[i] = 1 if close_arr[i] > final_u[i] else -1
+    f["st_dir"] = st_dir
+    f["st_line"] = np.where(st_dir == 1, final_l, final_u)
+
+    # CTA TSMOM multi-horizon returns & annualized volatility (assuming 6h bars -> 4*365 bars/year)
+    f["ret1"] = f["close"].pct_change()
+    f["vol28"] = f["ret1"].rolling(28).std() * np.sqrt(4.0 * 365.0)
+    f["ret_7d"] = f["close"].pct_change(28)
+    f["ret_21d"] = f["close"].pct_change(84)
+    f["ret_60d"] = f["close"].pct_change(240)
+
+    return f.iloc[warmup_bars:].dropna()
+
+
+def select_rotation_targets(
+    dfs: Dict[str, pd.DataFrame],
+    ema_len: int = 50,
+    fast_lb: int = 21,
+    slow_lb: int = 60,
+    vol_lb: int = 20,
+    top_k: int = 2,
+) -> Dict[str, object]:
+    """
+    Shared Cross-Asset Dual-Momentum Inverse-Vol ETF Rotation selector:
+      - Computes EMA(ema_len), blended momentum 0.5*ret(fast_lb) + 0.5*ret(slow_lb),
+        and annualized daily vol std(vol_lb) * sqrt(252) on closed daily bars.
+      - Qualifies ETFs with momentum > 0 AND close > EMA(ema_len).
+      - Selects up to `top_k` highest-momentum qualifiers weighted by inverse volatility,
+        scaling total invested weight by len(chosen) / top_k so unfilled slots stay in LIQUIDBEES.
+    """
+    scored = []
+    latest_prices: Dict[str, float] = {}
+    latest_bars: Dict[str, pd.Timestamp] = {}
+
+    for sym, raw in dfs.items():
+        if raw is None or len(raw) < max(slow_lb, ema_len, vol_lb) + 2:
+            continue
+        close = raw["close"].astype(float)
+        ema = close.ewm(span=ema_len, adjust=False).mean()
+        ret_fast = close.pct_change(fast_lb)
+        ret_slow = close.pct_change(slow_lb)
+        vol_ann = close.pct_change().rolling(vol_lb).std() * np.sqrt(252.0)
+
+        last_close = float(close.iloc[-1])
+        last_ema = float(ema.iloc[-1])
+        last_rf = float(ret_fast.iloc[-1])
+        last_rs = float(ret_slow.iloc[-1])
+        last_vol = float(vol_ann.iloc[-1])
+        if not (math.isfinite(last_close) and math.isfinite(last_ema) and math.isfinite(last_rf) and math.isfinite(last_rs)):
+            continue
+        if not math.isfinite(last_vol) or last_vol < 0.05:
+            last_vol = 0.15
+
+        mom = 0.5 * last_rf + 0.5 * last_rs
+        qualified = (mom > 0.0) and (last_close > last_ema)
+        latest_prices[sym] = last_close
+        latest_bars[sym] = raw.index[-1]
+        scored.append({
+            "symbol": sym,
+            "close": last_close,
+            "ema50": last_ema,
+            "ret_21d": last_rf,
+            "ret_60d": last_rs,
+            "momentum": mom,
+            "vol_ann": last_vol,
+            "qualified": qualified,
+        })
+
+    scored.sort(key=lambda r: r["momentum"], reverse=True)
+    qualifiers = [r for r in scored if r["qualified"]]
+    chosen = qualifiers[:top_k]
+
+    weights: Dict[str, float] = {}
+    if chosen and top_k > 0:
+        inv_vols = {r["symbol"]: 1.0 / r["vol_ann"] for r in chosen}
+        iv_sum = sum(inv_vols.values())
+        invest_frac = len(chosen) / float(top_k)
+        for r in chosen:
+            weights[r["symbol"]] = invest_frac * (inv_vols[r["symbol"]] / iv_sum)
+
+    cash_weight = max(1.0 - sum(weights.values()), 0.0)
+    return {
+        "rankings": scored,
+        "chosen": [r["symbol"] for r in chosen],
+        "weights": weights,
+        "cash_weight": cash_weight,
+        "prices": latest_prices,
+        "latest_bar": max(latest_bars.values()) if latest_bars else None,
+    }
+
+
 def _pnl(side: str, entry: float, exit_px: float, qty: float) -> float:
     return (exit_px - entry) * qty if side == "LONG" else (entry - exit_px) * qty
 

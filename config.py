@@ -61,7 +61,10 @@ class PortfolioConfig:
 
     # Spot ETFs are automatically restricted to LONG-ONLY (no naked shorting)
     long_only_assets: Set[str] = field(
-        default_factory=lambda: {"GOLDIETF.NS", "GOLDCASE.NS", "GOLDBEES.NS", "SILVERBEES.NS"}
+        default_factory=lambda: {
+            "GOLDIETF.NS", "GOLDCASE.NS", "GOLDBEES.NS", "SILVERBEES.NS",
+            "GOLDIETF", "GOLDCASE", "GOLDBEES", "SILVERBEES",
+        }
     )
 
     # Assets whose prices/ticks are denominated in USD rather than INR
@@ -94,9 +97,13 @@ class PortfolioConfig:
             "GOLDCASE.NS": 1.0,     # 1 ETF share
             "GOLDBEES.NS": 1.0,     # 1 ETF share
             "SILVERBEES.NS": 1.0,   # 1 ETF share (~1g silver)
-            "GOLDPETAL": 1.0 / 31.1035,  # MCX GOLDPETAL = 1g gold (in troy oz)
-            "GOLDM": 100.0 / 31.1035,    # MCX Gold Mini = 100g gold
-            "SILVERMIC": 32.1507,        # MCX Silver Micro = 1kg silver
+            "GOLDIETF": 1.0,        # Upstox NSE_EQ: 1 ETF share (INR)
+            "GOLDCASE": 1.0,        # Upstox NSE_EQ: 1 ETF share (INR)
+            "GOLDBEES": 1.0,        # Upstox NSE_EQ: 1 ETF share (INR)
+            "SILVERBEES": 1.0,      # Upstox NSE_EQ: 1 ETF share (INR)
+            "GOLDPETAL": 1.0,       # Upstox MCX GOLDPETAL: 1 lot = 1g (quoted per 1g in INR)
+            "GOLDM": 10.0,          # Upstox MCX GOLDM: 1 lot = 100g (quoted per 10g in INR)
+            "SILVERMIC": 1.0,       # Upstox MCX SILVERMIC: 1 lot = 1kg (quoted per 1kg in INR)
             "GC=F": 1.0 / 31.1035,       # Proxy mapped to MCX GOLDPETAL (1g)
             "SI=F": 1.0 / 31.1035,       # Proxy mapped to SILVERBEES (~1g silver)
         }
@@ -132,7 +139,19 @@ class DeltaLiveConfig:
     use_maker_entry: bool = field(default_factory=lambda: _env_bool("DELTA_MAKER_ENTRY", "true"))
     maker_timeout_sec: float = field(default_factory=lambda: float(os.getenv("DELTA_MAKER_TIMEOUT_SEC", "15.0")))
 
-    # Strategy Parameters (Config C: 6H, 5-Coin Basket, 3.5x ATR Trail, Winner Pyramiding + 15% DD Brake)
+    # Strategy Parameters (Config C or 4-Pod Balanced: Donchian + Supertrend+ADX + CTA TSMOM + Funding+Vol Squeeze)
+    strategy_mode: str = field(default_factory=lambda: os.getenv("DELTA_STRATEGY_MODE", "config_c").strip().lower())
+    pod_weight_donchian: float = 0.30             # 4-Pod Balanced Pod 1 weight
+    pod_weight_supertrend: float = 0.25           # 4-Pod Balanced Pod 2 weight (Supertrend(10,3)+ADX>20)
+    pod_weight_tsmom: float = 0.25                # 4-Pod Balanced Pod 3 weight (CTA TSMOM Vol-Target)
+    pod_weight_squeeze: float = 0.35              # 4-Pod Balanced Pod 4 weight (Funding + Volume Squeeze)
+    squeeze_atr_trail_mult: float = 3.0           # 3.0x ATR trailing stop for Pod 4 Squeeze
+    squeeze_vol_mult: float = 1.5                 # Volume surge threshold (> 1.5x 20-bar avg)
+    squeeze_long_max_funding: float = 0.00005     # <= 0.005% 3d avg funding for LONG squeeze
+    squeeze_short_min_funding: float = 0.00015    # >= 0.015% 3d avg funding for SHORT squeeze
+    tsmom_rebalance_bars: int = 8                 # Rebalance TSMOM every 8 bars (48h on 6h)
+    tsmom_target_vol: float = 0.35                # Annualized vol target before pod weight & DD scale
+    catastrophe_stop_atr_mult: float = 4.5        # Protective exchange stop when only TSMOM is open
     symbols: List[str] = field(
         default_factory=lambda: _env_symbols("DELTA_SYMBOLS", ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "DOGEUSD"])
     )
@@ -166,6 +185,8 @@ class DeltaLiveConfig:
             raise ValueError("DELTA_MAKER_ENTRY must be true or false")
         if self.env not in {"prod", "testnet"}:
             raise ValueError("DELTA_ENV must be testnet or prod")
+        if self.strategy_mode not in {"config_c", "3pod"}:
+            raise ValueError("DELTA_STRATEGY_MODE must be config_c or 3pod")
         if self.resolution not in {"1h", "2h", "4h", "6h", "12h", "1d"}:
             raise ValueError("DELTA_RESOLUTION must be one of 1h, 2h, 4h, 6h, 12h, 1d")
         if not self.dry_run and self.env != "testnet":
@@ -182,7 +203,8 @@ class DeltaLiveConfig:
             raise ValueError("pyramid_add_fraction must be between 0.0 and 1.0")
         if not isfinite(self.dd_brake_threshold) or not (0.0 <= self.dd_brake_threshold < 0.5):
             raise ValueError("dd_brake_threshold must be between 0.0 and 0.5")
-        mode = f"{self.env}-{'paper' if self.dry_run else 'orders'}"
+        mode_prefix = "3pod-" if self.strategy_mode == "3pod" else ""
+        mode = f"{mode_prefix}{self.env}-{'paper' if self.dry_run else 'orders'}"
         base_dir = Path(self.data_dir).expanduser().resolve()
         self.data_dir = str(base_dir)
         self.state_file = self.state_file or str(base_dir / f"bot_state-{mode}.json")
@@ -198,9 +220,20 @@ class DeltaLiveConfig:
 
 @dataclass
 class KotakMcxConfig:
-    """Sleeve 2: Kotak Neo MCX GOLDPETAL (1g) + NSE SILVERBEES.NS (long-only) advisor config."""
+    """Sleeve 2: Kotak Neo Advisor — 'rotation' (All-6 Top-2 Vol-Parity ETFs + LIQUIDBEES) or 'config_c' (MCX GOLDPETAL + SILVERBEES)."""
     capital_inr: float = field(default_factory=lambda: float(os.getenv("KOTAK_CAPITAL_INR", "98000.0")))
+    strategy_mode: str = field(default_factory=lambda: os.getenv("KOTAK_STRATEGY_MODE", "config_c").strip().lower())
+    data_source: str = field(default_factory=lambda: os.getenv("KOTAK_DATA_SOURCE", "upstox").strip().lower())
     usd_inr_rate: float = field(default_factory=lambda: float(os.getenv("USD_INR_RATE", "85.0")))
+    rotation_symbols: List[str] = field(
+        default_factory=lambda: _env_symbols(
+            "KOTAK_ROTATION_SYMBOLS",
+            ["GOLDBEES", "SILVERBEES", "NIFTYBEES", "MID150BEES", "BANKBEES", "ITBEES"],
+        )
+    )
+    rotation_top_k: int = 2
+    rotation_rebal_days: int = 10
+    rotation_cash_symbol: str = "LIQUIDBEES"
     risk_per_trade_pct: float = 0.025             # 2.5% risk per trade
     max_concurrent_risk_pct: float = 0.08         # 8.0% max total open risk
     max_leverage_mcx: float = 8.0                 # ~12.5% MCX margin assumption
@@ -216,14 +249,24 @@ class KotakMcxConfig:
     dd_brake_scale: float = 0.5
     data_dir: str = field(default_factory=lambda: os.getenv("BOT_DATA_DIR", "."))
     state_file: str = ""
+    journal_file: str = ""
     telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""), repr=False)
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
 
     def __post_init__(self):
+        if self.strategy_mode not in {"config_c", "rotation"}:
+            raise ValueError("KOTAK_STRATEGY_MODE must be rotation or config_c")
+        if self.data_source not in {"upstox", "yfinance"}:
+            raise ValueError("KOTAK_DATA_SOURCE must be upstox or yfinance")
         if self.resolution not in {"1h", "2h", "4h", "6h", "12h", "1d"}:
             raise ValueError("KOTAK_RESOLUTION must be one of 1h, 2h, 4h, 6h, 12h, 1d")
         if not isfinite(self.capital_inr) or self.capital_inr <= 0:
             raise ValueError("KOTAK_CAPITAL_INR must be positive and finite")
         base_dir = Path(self.data_dir).expanduser().resolve()
         self.data_dir = str(base_dir)
-        self.state_file = self.state_file or str(base_dir / "kotak_mcx_state.json")
+        if self.strategy_mode == "rotation":
+            self.state_file = self.state_file or str(base_dir / "kotak_rotation_state.json")
+            self.journal_file = self.journal_file or str(base_dir / "kotak_rotation_journal.csv")
+        else:
+            self.state_file = self.state_file or str(base_dir / "kotak_mcx_state.json")
+            self.journal_file = self.journal_file or str(base_dir / "kotak_mcx_journal.csv")

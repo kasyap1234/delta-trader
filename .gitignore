@@ -15,6 +15,9 @@ trade_journal-*.csv
 *.log
 *.log.*
 
+# Generated research runs (committed historical exports live in research/snapshots/)
+/research/output/
+
 # Python bytecode & virtualenvs
 __pycache__/
 *.py[cod]
