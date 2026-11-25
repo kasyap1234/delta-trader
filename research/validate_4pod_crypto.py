@@ -1,14 +1,6 @@
-"""
-Single-Account Shared-Margin Validation: 3-Pod Balanced vs. 4-Pod (+ Funding & Volume Squeeze)
-==============================================================================================
-Tests inside ONE shared $1,200 USD account (whole lots, shared 75% max margin cap,
-portfolio-level 15% drawdown brake, actual 8h Binance funding rates, 0.04% maker & 0.15% taker):
-  - Baseline      : Unchanged Config C (100%)
-  - 3-Pod Balanced: 0.40 Donchian + 0.35 Supertrend+ADX + 0.35 CTA TSMOM
-  - 4-Pod Balanced: 0.30 Donchian + 0.25 Supertrend+ADX + 0.25 CTA TSMOM + 0.35 Funding+Vol Squeeze
-  - 4-Pod Growth  : 0.40 Donchian + 0.35 Supertrend+ADX + 0.35 CTA TSMOM + 0.35 Funding+Vol Squeeze
-"""
+"""Legacy five-coin Binance proxy benchmark (not shared decision parity or a Delta fill replay)."""
 
+from dataclasses import asdict
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -23,10 +15,8 @@ from research.crypto_idle_margin_study import (
     load_binance_funding,
     load_cached_binance_klines,
 )
-from research.crypto_trend_csmom_5y import make_cfg
 from research.outputs import new_run_directory
 from research.portfolio_backtest import calc_curve_stats
-from portfolio_engine import run_shared_donchian_portfolio
 
 
 def prepare_4pod_frames(
@@ -316,33 +306,31 @@ def run_shared_4pod(
 
 
 def main():
-    out_dir = new_run_directory("validate-4pod-crypto")
-    bin_dfs = {sym: load_cached_binance_klines(sym, "6h", "2021-11-24", "2026-11-23") for sym in TOP5_COINS}
-    fund_map = {sym: load_binance_funding(sym, "2021-08-01", "2026-11-23") for sym in TOP5_COINS}
-
-    for title, s_d, e_d in [
-        ("BINANCE 5Y FULL (2021-11-24 -> 2026-11-23)", "2021-11-24", "2026-11-23"),
-        ("BINANCE IS 3Y (2021-11-24 -> 2024-11-23)", "2021-11-24", "2024-11-23"),
-        ("BINANCE OOS 2Y (2024-11-24 -> 2026-11-23)", "2024-11-24", "2026-11-23"),
-    ]:
-        prepped = prepare_4pod_frames(bin_dfs, fund_map, s_d, e_d)
-        rows = []
-        for slip_lbl, eslip in [("Maker 0.04%", 0.0004), ("Taker 0.15%", 0.0015)]:
-            for name, w in [
-                ("3-Pod Balanced (0.40/0.35/0.35/0.00)", (0.40, 0.35, 0.35, 0.00)),
-                ("4-Pod Balanced (0.30/0.25/0.25/0.35)", (0.30, 0.25, 0.25, 0.35)),
-                ("4-Pod Growth   (0.40/0.35/0.35/0.35)", (0.40, 0.35, 0.35, 0.35)),
-                ("4-Pod Squeeze+ (0.40/0.35/0.35/0.50)", (0.40, 0.35, 0.35, 0.50)),
-            ]:
-                tr, eq, diag = run_shared_4pod(prepped, fund_map, w, entry_slip=eslip, exit_slip=0.0015)
-                st = calc_curve_stats(f"[{slip_lbl}] {name}", eq, tr, 1200.0)
-                st["PkMgn%"] = diag["peak_margin_pct"]
-                rows.append(st)
-        print(f"\n================ {title} ================")
-        df_r = pd.DataFrame(rows)
-        print(df_r.to_string(index=False))
-        df_r.to_csv(out_dir / f"{title.split()[1].lower()}_results.csv", index=False)
-    print(f"\nSaved 4-Pod validation tables to {out_dir}/")
+    print("Legacy Binance proxy benchmark: different decisions and independent pod stops, not live parity.")
+    start, end = "2021-11-24", "2026-11-23"
+    capital = 1200.0
+    candles = {sym: load_cached_binance_klines(sym, "6h", start, end) for sym in TOP5_COINS}
+    funding = {sym: load_binance_funding(sym, "2021-08-01", end) for sym in TOP5_COINS}
+    frames = prepare_4pod_frames(candles, funding, start, end)
+    if set(frames) != set(TOP5_COINS) or any(f.empty for f in funding.values()):
+        raise RuntimeError("The five-coin benchmark requires price and funding data for all five symbols")
+    trades, equity, diagnostics = run_shared_4pod(
+        frames, funding, (0.30, 0.25, 0.25, 0.35),
+        capital_init=capital, entry_slip=0.0004, exit_slip=0.0015,
+    )
+    if not math.isclose(equity.iloc[-1], capital + sum(t.net_pnl for t in trades), abs_tol=1e-6):
+        raise RuntimeError("Equity does not reconcile to the trade ledger")
+    summary = calc_curve_stats("Four-Pod Balanced (Binance proxy)", equity, trades, capital)
+    summary["PkMgn%"] = diagnostics["peak_margin_pct"]
+    out_dir = new_run_directory("four-pod-balanced-binance-proxy")
+    results = pd.DataFrame([summary])
+    results.to_csv(out_dir / "summary.csv", index=False)
+    pd.DataFrame(asdict(trade) for trade in trades).to_csv(out_dir / "trades.csv", index=False)
+    equity.rename("equity_usd").to_csv(out_dir / "equity.csv", index_label="timestamp")
+    print(f"Binance USD-M perpetuals, 6h, {start} through {end} | ${capital:,.0f} starting capital")
+    print("Modeled slippage: 0.04% entry, 0.15% exit. No separate commission.")
+    print(results.to_string(index=False))
+    print(f"Saved summary, equity and trade ledger to {out_dir}")
 
 
 if __name__ == "__main__":

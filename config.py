@@ -152,9 +152,7 @@ class DeltaLiveConfig:
     tsmom_rebalance_bars: int = 8                 # Rebalance TSMOM every 8 bars (48h on 6h)
     tsmom_target_vol: float = 0.35                # Annualized vol target before pod weight & DD scale
     catastrophe_stop_atr_mult: float = 4.5        # Protective exchange stop when only TSMOM is open
-    symbols: List[str] = field(
-        default_factory=lambda: _env_symbols("DELTA_SYMBOLS", ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "DOGEUSD"])
-    )
+    symbols: List[str] = field(default_factory=lambda: _env_symbols("DELTA_SYMBOLS", []))
     resolution: str = field(default_factory=lambda: os.getenv("DELTA_RESOLUTION", "6h").strip().lower())
     donchian_entry_len: int = 20
     ema_fast: int = 50
@@ -185,8 +183,14 @@ class DeltaLiveConfig:
             raise ValueError("DELTA_MAKER_ENTRY must be true or false")
         if self.env not in {"prod", "testnet"}:
             raise ValueError("DELTA_ENV must be testnet or prod")
-        if self.strategy_mode not in {"config_c", "3pod"}:
-            raise ValueError("DELTA_STRATEGY_MODE must be config_c or 3pod")
+        if not self.symbols:
+            self.symbols = ["BTCUSD", "ETHUSD", "SOLUSD", "DOGEUSD"]
+            if self.env == "prod":
+                self.symbols.insert(3, "BNBUSD")
+        if self.strategy_mode == "3pod":
+            self.strategy_mode = "four_pod_balanced"
+        if self.strategy_mode not in {"config_c", "four_pod_balanced"}:
+            raise ValueError("DELTA_STRATEGY_MODE must be config_c or four_pod_balanced")
         if self.resolution not in {"1h", "2h", "4h", "6h", "12h", "1d"}:
             raise ValueError("DELTA_RESOLUTION must be one of 1h, 2h, 4h, 6h, 12h, 1d")
         if not self.dry_run and self.env != "testnet":
@@ -203,7 +207,8 @@ class DeltaLiveConfig:
             raise ValueError("pyramid_add_fraction must be between 0.0 and 1.0")
         if not isfinite(self.dd_brake_threshold) or not (0.0 <= self.dd_brake_threshold < 0.5):
             raise ValueError("dd_brake_threshold must be between 0.0 and 0.5")
-        mode_prefix = "3pod-" if self.strategy_mode == "3pod" else ""
+        # Keep the existing state, journal and lock paths for account reconciliation.
+        mode_prefix = "3pod-" if self.strategy_mode == "four_pod_balanced" else ""
         mode = f"{mode_prefix}{self.env}-{'paper' if self.dry_run else 'orders'}"
         base_dir = Path(self.data_dir).expanduser().resolve()
         self.data_dir = str(base_dir)

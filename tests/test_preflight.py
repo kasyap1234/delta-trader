@@ -206,6 +206,7 @@ class DeltaFixture:
 
 class DeltaSafetyTest(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, {"DELTA_STRATEGY_MODE": "config_c"}))
         location = self.enterContext(tempfile.TemporaryDirectory())
         self.cfg = DeltaLiveConfig(
             env="testnet", dry_run=False, symbols=["ETHUSD"], capital_usd=1200,
@@ -593,6 +594,7 @@ class HardeningRegressionTest(unittest.TestCase):
 
 class ConfigCMaxAggressionTest(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, {"DELTA_STRATEGY_MODE": "config_c"}))
         self.location = self.enterContext(tempfile.TemporaryDirectory())
         self.exchange = DeltaFixture()
         self.end = pd.Timestamp.now(tz="UTC").floor("6h") - pd.Timedelta(hours=6)
@@ -607,7 +609,10 @@ class ConfigCMaxAggressionTest(unittest.TestCase):
     def test_config_c_defaults(self):
         with patch.dict(os.environ, {"DELTA_ENV": "testnet", "DRY_RUN": "true", "DELTA_SYMBOLS": ""}, clear=False):
             cfg = DeltaLiveConfig(data_dir=self.location)
-        self.assertEqual(cfg.symbols, ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "DOGEUSD"])
+        self.assertEqual(cfg.symbols, ["BTCUSD", "ETHUSD", "SOLUSD", "DOGEUSD"])
+        with patch.dict(os.environ, {"DELTA_SYMBOLS": ""}, clear=False):
+            production = DeltaLiveConfig(env="prod", dry_run=True, data_dir=self.location)
+        self.assertEqual(production.symbols, ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "DOGEUSD"])
         self.assertEqual(cfg.resolution, "6h")
         self.assertEqual(cfg.risk_per_trade_pct, 0.02)
         self.assertEqual(cfg.max_concurrent_risk_pct, 0.08)
@@ -913,8 +918,12 @@ class ThreePodLiveEngineTest(unittest.TestCase):
     def _candles(self, symbol, **kwargs):
         return bars(pd.date_range(end=self.end, freq="6h", periods=300), self.start, 1.0)
 
-    def test_3pod_state_file_isolation_and_config_validation(self):
-        cfg = DeltaLiveConfig(env="testnet", dry_run=True, strategy_mode="3pod", data_dir=self.location)
+    def test_four_pod_name_preserves_legacy_state_paths(self):
+        cfg = DeltaLiveConfig(env="testnet", dry_run=True, strategy_mode="four_pod_balanced", data_dir=self.location)
+        legacy = DeltaLiveConfig(env="testnet", dry_run=True, strategy_mode="3pod", data_dir=self.location)
+        self.assertEqual(legacy.strategy_mode, cfg.strategy_mode)
+        for name in ("state_file", "journal_file", "log_file"):
+            self.assertEqual(getattr(legacy, name), getattr(cfg, name))
         self.assertIn("bot_state-3pod-testnet-paper.json", cfg.state_file)
         self.assertIn("trade_journal-3pod-testnet-paper.csv", cfg.journal_file)
         with self.assertRaisesRegex(ValueError, "DELTA_STRATEGY_MODE"):

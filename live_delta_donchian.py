@@ -45,7 +45,11 @@ import requests
 
 from config import DeltaLiveConfig
 from data_loader import DELTA_INDIA_BASE, load_delta_candles, load_delta_funding_avg
-from portfolio_engine import add_3pod_features, add_donchian_features, add_ema_atr_features
+from four_pod_engine import (
+    CANDLE_DAYS, DecisionContext, DecisionRules, FundingRequest, InvalidClosedBar, Market, NetIntent,
+    decide_four_pod, prepare_bar,
+)
+from portfolio_engine import add_donchian_features, add_ema_atr_features
 
 log = logging.getLogger("DeltaDonchianBot")
 
@@ -136,12 +140,14 @@ class DeltaExchangeClient:
                     raise DeltaAPIError(response.status_code, method, path, error if isinstance(error, dict) else {})
             time.sleep(.5 * 2**attempt)
 
-    def load_products(self) -> None:
+    def load_products(self, *, reconcile_symbols=()) -> None:
         resp = self._request("GET", "/v2/products", auth=False)
+        configured = set(self.cfg.symbols)
+        optional = set(reconcile_symbols) - configured
         products = {}
         for p in resp.get("result", []):
             sym = p.get("symbol")
-            if sym in self.cfg.symbols:
+            if sym in configured:
                 if p["notional_type"] != "vanilla" or any(p[k]["symbol"] != "USD" for k in ("quoting_asset", "settling_asset")):
                     raise RuntimeError(f"Unsupported contract denomination for {sym}")
                 max_lev_notional = float(p.get("max_leverage_notional") or 0)
@@ -155,7 +161,19 @@ class DeltaExchangeClient:
                     "fee_rate": float(p["taker_commission_rate"]) * 1.18,
                     "maker_fee_rate": float(p.get("maker_commission_rate", p["taker_commission_rate"])) * 1.18,
                 }
-        if set(products) != set(self.cfg.symbols):
+            elif sym in optional:
+                # Excluded symbols may need to reconcile a pending entry fill.
+                # Never use this metadata to size or open a new trade.
+                if (p.get("notional_type") == "vanilla"
+                        and all((p.get(k) or {}).get("symbol") == "USD" for k in ("quoting_asset", "settling_asset"))):
+                    try:
+                        product_id = int(p["id"])
+                        contract_value = float(p["contract_value"])
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        continue
+                    if product_id > 0 and math.isfinite(contract_value) and contract_value > 0:
+                        products[sym] = {"id": product_id, "contract_value": contract_value}
+        if not configured.issubset(products):
             raise RuntimeError("Delta did not return all configured products")
         self.products_cache = products
         log.info(f"Loaded Delta products ({self.cfg.env}): {self.products_cache}")
@@ -387,10 +405,22 @@ class LiveDonchianEngine:
                 return True
         return False
 
-    def _reconcile(self, sym: str, meta: dict, wait_for_bracket: bool = True) -> None:
+    def _entries_blocked(self, entry_blockers=()) -> bool:
+        return bool(entry_blockers or self.state.get("halt_new_entries") or self._circuit_breaker_tripped())
+
+    def _reconcile(self, sym: str, meta: dict, wait_for_bracket: bool = True, *, retry_trail: bool = True) -> None:
         positions = self.state["positions"]
         pos = positions.get(sym)
         product = meta["id"]
+        if pos is not None and "pending_net" in pos:
+            try:
+                self._reconcile_net_order(sym, product, pos)
+            except Exception:
+                # The old snapshot is not proof of coverage while the IOC is unresolved.
+                self.state["halt_new_entries"] = True
+                self._save_state()
+                raise
+            return
         remote = self.client.position(product)
         size = int(remote["size"])
         orders = self.client.open_orders(product)
@@ -483,7 +513,7 @@ class LiveDonchianEngine:
                 refreshed = int(self.client.position(product)["size"])
                 orders = self.client.open_orders(product)
                 if refreshed != size or orders:
-                    return self._reconcile(sym, meta, wait_for_bracket=False)
+                    return self._reconcile(sym, meta, wait_for_bracket=False, retry_trail=retry_trail)
 
         if not orders:
             if int(self.client.position(product)["size"]) != size:
@@ -510,7 +540,122 @@ class LiveDonchianEngine:
                        init_sl_dist=init_sl_dist, entry_fee=entry_fee, sl_order_id=int(stop["id"]),
                        risk_usd=risk_usd, risk_pct=risk_usd / self.state["equity_usd"])
             log.info("%s: reconciled %s contracts with verified stop %s", sym, size, stop["id"])
+        if "pending_trail" in pos:
+            target = pos["pending_trail"]["stop_price"]
+            intended = Decimal(target)
+            if (not intended.is_finite() or intended <= 0 or (intended - previous) * sign <= 0
+                    or stop["state"] not in {"open", "pending"}
+                    or Decimal(str(remote["size"])) != sign * pos["contracts"]
+                    or Decimal(str(stop["unfilled_size"])) != pos["contracts"]):
+                raise RuntimeError(f"{sym}: invalid pending trail or protective stop; reconcile manually")
+            if stop_px != intended:
+                if stop_px != previous:
+                    raise RuntimeError(f"{sym}: unexpected stop price during pending trail; reconcile manually")
+                if not retry_trail:
+                    raise RuntimeError(f"{sym}: trail stop edit not yet confirmed")
+                # Edit only the verified, unchanged stop. Read back once, including the normal flat/exit path.
+                self.client.edit_stop(product, pos["sl_order_id"], pos["contracts"], target)
+                return self._reconcile(sym, meta, wait_for_bracket=wait_for_bracket, retry_trail=False)
+            del pos["pending_trail"]
+            log.info("3POD TRAIL SL %s %s | %s -> %s", sym, pos["side"], previous, stop_px)
         pos["sl_price"] = format(stop_px, "f")
+        self._save_state()
+
+    @staticmethod
+    def _net_stop_matches(stop: dict, pos: dict) -> bool:
+        stop_px = Decimal(stop["stop_price"] or "0")
+        return (int(stop["id"]) == pos["sl_order_id"]
+                and stop["state"] in {"open", "pending"}
+                and stop["side"] == ("sell" if pos["side"] == "LONG" else "buy")
+                and stop["stop_order_type"] == "stop_loss_order" and stop["order_type"] == "market_order"
+                and stop["stop_trigger_method"] == "mark_price" and stop["reduce_only"] in (True, "true")
+                and stop_px.is_finite() and stop_px > 0)
+
+    def _reconcile_net_order(self, sym: str, product: int, pos: dict) -> None:
+        """Resolve one IOC; only commit the new snapshot once its stop is confirmed."""
+        pending = pos["pending_net"]
+        cid = pending["client_order_id"]
+        diff = pending["signed_delta"]
+        sign = 1 if pos["side"] == "LONG" else -1
+        before = sign * pos["contracts"]
+        is_reduce = before * diff < 0
+        limit = Decimal(pending["limit_price"])
+        if not diff or (is_reduce and abs(diff) > abs(before)) or not limit.is_finite() or limit <= 0:
+            raise RuntimeError(f"{sym}: invalid persisted net IOC ({cid})")
+        # A missing lookup (including 404) does not prove non-acceptance. Never POST from recovery.
+        order = self.client._request("GET", f"/v2/orders/client_order_id/{cid}")["result"]
+        unfilled = Decimal(str(order["unfilled_size"]))
+        reduce_flag = (True, "true") if is_reduce else (False, "false")
+        if (order["state"] not in {"closed", "cancelled"} or Decimal(str(order["product_id"])) != product
+                or order.get("client_order_id", cid) != cid or order["side"] != ("buy" if diff > 0 else "sell")
+                or order.get("order_type", "limit_order") != "limit_order" or order.get("time_in_force", "ioc") != "ioc"
+                or order.get("reduce_only", is_reduce) not in reduce_flag
+                or Decimal(str(order.get("limit_price", limit))) != limit
+                or Decimal(str(order["size"])) != abs(diff) or not unfilled.is_finite()
+                or not 0 <= unfilled <= abs(diff) or unfilled != unfilled.to_integral_value()):
+            raise RuntimeError(f"{sym}: net IOC not reconciled ({cid})")
+        filled = abs(diff) - int(unfilled)
+        remaining = before + (filled if diff > 0 else -filled)
+        if filled:
+            price = Decimal(str(order["average_fill_price"]))
+            fill_px, fill_fee = float(price), float(order["paid_commission"])
+            if not math.isfinite(fill_px) or fill_px <= 0 or not math.isfinite(fill_fee):
+                raise RuntimeError(f"{sym}: invalid net IOC fill ({cid})")
+            if (diff > 0 and price > limit) or (diff < 0 and price < limit):
+                raise RuntimeError(f"{sym}: net IOC fill outside persisted limit ({cid})")
+
+        def confirmed_orders() -> list:
+            orders = self.client.open_orders(product)
+            size = Decimal(str(self.client.position(product)["size"]))
+            if size != remaining:
+                raise RuntimeError(f"{sym}: exchange position does not match net IOC ({cid}); reconcile manually")
+            if orders and (len(orders) != 1 or not self._net_stop_matches(orders[0], pos)):
+                raise RuntimeError(f"{sym}: unexpected orders after net IOC ({cid}); reconcile manually")
+            return orders
+
+        orders = confirmed_orders()
+        if not remaining:
+            at = exchange_timestamp(order["updated_at"])
+            if orders:
+                # Never cancel protection ahead of the IOC. Cancel only our verified stop once flat.
+                self.client.cancel_order(product, pos["sl_order_id"])
+                if confirmed_orders():
+                    raise RuntimeError(f"{sym}: old stop still visible after net close ({cid})")
+            self._record_exit(sym, pos, fill_px, pos.get("entry_fee", 0.0) + fill_fee, at)
+            return
+
+        old_stop = Decimal(pos["sl_price"])
+        stop_price = pending["stop_price"] if filled else pos["sl_price"]
+        intended = Decimal(stop_price)
+
+        def protection(orders: list) -> tuple[Decimal, Decimal]:
+            if not orders:
+                raise RuntimeError(f"{sym}: protective stop missing after net IOC ({cid}); check testnet account now")
+            return Decimal(str(orders[0]["unfilled_size"])), Decimal(orders[0]["stop_price"])
+
+        actual_qty, actual_stop = protection(orders)
+        if actual_qty != abs(remaining) or actual_stop != intended:
+            if actual_qty not in {abs(before), abs(remaining)} or actual_stop not in {old_stop, intended}:
+                raise RuntimeError(f"{sym}: unexpected protective stop after net IOC ({cid}); reconcile manually")
+            # Missing means legacy state: an edit may already have been sent. Only an
+            # explicitly unspent reduction intent can issue a resize, once.
+            if not is_reduce or pending.get("stop_edit_attempted") is not False:
+                raise RuntimeError(f"{sym}: protective stop resize unconfirmed after net IOC ({cid}); reconcile manually")
+            pending["stop_edit_attempted"] = True
+            self._save_state()
+            self.client.edit_stop(product, pos["sl_order_id"], abs(remaining), stop_price)
+            if protection(confirmed_orders()) != (abs(remaining), intended):
+                raise RuntimeError(f"{sym}: protective stop resize unconfirmed after net IOC ({cid}); reconcile manually")
+
+        # Account for the fill once, in the same state write that clears the intent.
+        if filled:
+            if is_reduce:
+                self._account_partial_exit(pos, filled, fill_px, fill_fee, exchange_timestamp(order["updated_at"]))
+            else:
+                pos["entry_price"] = (pos["entry_price"] * abs(before) + fill_px * filled) / abs(remaining)
+                pos["entry_fee"] = pos.get("entry_fee", 0.0) + fill_fee
+        pos.update(contracts=abs(remaining), sl_price=stop_price)
+        del pos["pending_net"]
         self._save_state()
 
     def _emergency_close(self, sym, product, pos, size, reason):
@@ -562,16 +707,24 @@ class LiveDonchianEngine:
 
     def run_cycle(self, *, resume: bool = False) -> bool:
         self._reset_periodic_counters()
+        configured = set(self.cfg.symbols)
+        persisted = sorted(self.state["positions"].keys() - configured)
         if not self.client.products_cache:
-            self.client.load_products()
+            self.client.load_products(reconcile_symbols=persisted if not self.cfg.dry_run else ())
         errors = []
         entry_blockers = []
         reconciled = []
-        for sym in self.cfg.symbols:
+        for sym in dict.fromkeys([*self.cfg.symbols, *persisted]):
             try:
                 if not self.cfg.dry_run:
-                    self._reconcile(sym, self.client.products_cache[sym])
-                reconciled.append(sym)
+                    meta = self.client.products_cache.get(sym)
+                    if not meta:
+                        raise RuntimeError(f"{sym}: product metadata unavailable; reconcile the persisted position manually")
+                    self._reconcile(sym, meta)
+                if sym in configured:
+                    reconciled.append(sym)
+                elif sym in self.state["positions"]:
+                    raise RuntimeError(f"{sym}: persisted position outside configured basket; manage it before adding risk")
             except Exception as error:
                 log.error("%s reconciliation failed: %s", sym, error)
                 errors.append(error)
@@ -594,7 +747,7 @@ class LiveDonchianEngine:
             self._save_state()
             return False
 
-        if self.cfg.strategy_mode == "3pod":
+        if self.cfg.strategy_mode == "four_pod_balanced":
             return self._run_3pod_cycle(reconciled, errors, entry_blockers, available)
 
         # Manage verified positions before considering any new orders.
@@ -602,7 +755,7 @@ class LiveDonchianEngine:
         retry = False
         for sym in reconciled:
             try:
-                candidate, stale = self._process_symbol(sym)
+                candidate, stale = self._process_symbol(sym, entry_blockers=entry_blockers)
                 retry |= stale
                 if candidate:
                     candidates.append(candidate)
@@ -627,7 +780,7 @@ class LiveDonchianEngine:
             raise errors[0]
         return retry
 
-    def _process_symbol(self, sym):
+    def _process_symbol(self, sym, *, entry_blockers=()):
         meta = self.client.products_cache[sym]
         raw_df = load_delta_candles(sym, resolution=self.cfg.resolution, days=60, base_url=self.cfg.base_url)
         period = pd.Timedelta("1D" if self.cfg.resolution == "1d" else self.cfg.resolution)
@@ -658,13 +811,13 @@ class LiveDonchianEngine:
         mark_px, best_bid, best_ask = self.client.get_ticker_quotes(sym)
         atr = float(closed["atr14"])
         if pos is not None:
-            self._manage_position(sym, meta, pos, mark_px, float(closed["close"]), atr, history, period)
+            self._manage_position(sym, meta, pos, mark_px, float(closed["close"]), atr, history, period,
+                                  entry_blockers=entry_blockers)
             return None, False
         return (sym, meta, expected, period, closed, mark_px, best_bid, best_ask, atr), False
 
     def _consider_entry(self, sym, meta, expected, period, closed, mark_px, best_bid, best_ask, atr, available):
-        if (self.state.get("halt_new_entries") or self._circuit_breaker_tripped()
-                or self.state["last_entry_bar"].get(sym) == expected.isoformat()):
+        if self._entries_blocked() or self.state["last_entry_bar"].get(sym) == expected.isoformat():
             return
 
         open_positions = self.state["positions"]
@@ -831,14 +984,30 @@ class LiveDonchianEngine:
         log.info(msg)
         send_telegram(self.cfg, msg)
 
-    def _record_exit(self, sym: str, pos: dict, exit_px: float, fees: float, at: datetime) -> None:
+    def _account_partial_exit(self, pos: dict, quantity: int, exit_px: float, exit_fee: float, at: datetime) -> None:
         sign = 1 if pos["side"] == "LONG" else -1
-        pnl_usd = (exit_px - pos["entry_price"]) * sign * pos["contracts"] * pos["contract_value"] - fees
+        ratio = quantity / pos["contracts"]
+        fees = exit_fee
+        for key in ("entry_fee", "paper_funding"):
+            if key in pos:
+                allocated = pos[key] * ratio
+                pos[key] -= allocated
+                fees += allocated
+        pnl = (exit_px - pos["entry_price"]) * sign * quantity * pos["contract_value"] - fees
+        self._account_realized_pnl(pnl, at)
+        self._update_drawdown_brake()
+
+    def _account_realized_pnl(self, pnl_usd: float, at: datetime) -> None:
         self.state["equity_usd"] += pnl_usd
         for period, key, counter in (("day", at.strftime("%Y-%m-%d"), "daily_pnl_usd"),
                                      ("week", at.strftime("%G-W%V"), "weekly_pnl_usd")):
             if key == self.state[f"last_{period}"] or pnl_usd < 0:
                 self.state[counter] += pnl_usd
+
+    def _record_exit(self, sym: str, pos: dict, exit_px: float, fees: float, at: datetime) -> None:
+        sign = 1 if pos["side"] == "LONG" else -1
+        pnl_usd = (exit_px - pos["entry_price"]) * sign * pos["contracts"] * pos["contract_value"] - fees
+        self._account_realized_pnl(pnl_usd, at)
         del self.state["positions"][sym]
         self._update_drawdown_brake()
         self._save_state()
@@ -857,7 +1026,8 @@ class LiveDonchianEngine:
         ticks = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_CEILING if sign > 0 else ROUND_FLOOR)
         return format(ticks * tick, "f")
 
-    def _manage_position(self, sym: str, meta: dict, pos: dict, mark_px: float, closed_px: float, atr: float, history, period) -> None:
+    def _manage_position(self, sym: str, meta: dict, pos: dict, mark_px: float, closed_px: float, atr: float,
+                         history, period, *, entry_blockers=()) -> None:
         sign = 1 if pos["side"] == "LONG" else -1
         old_sl = float(pos["sl_price"])
         if self.cfg.dry_run:
@@ -904,15 +1074,14 @@ class LiveDonchianEngine:
         else:
             log.info(f"HOLD {sym} {pos['side']} | Mark={mark_px:.2f} | SL={old_sl} | Unchanged.")
 
-        self._maybe_pyramid(sym, meta, pos, mark_px)
+        self._maybe_pyramid(sym, meta, pos, mark_px, entry_blockers=entry_blockers)
 
-    def _maybe_pyramid(self, sym: str, meta: dict, pos: dict, mark_px: float) -> None:
+    def _maybe_pyramid(self, sym: str, meta: dict, pos: dict, mark_px: float, *, entry_blockers=()) -> None:
         if (
             self.cfg.pyramid_add_fraction <= 0
             or pos.get("pyramided")
             or "pending_pyramid" in pos
-            or self.state.get("halt_new_entries")
-            or self._circuit_breaker_tripped()
+            or self._entries_blocked(entry_blockers)
         ):
             return
         init_entry = float(pos.get("init_entry_price", pos["entry_price"]))
@@ -1015,48 +1184,22 @@ class LiveDonchianEngine:
             raise errors[0]
         return retry
 
-    def _pod_margin_used(self) -> float:
-        total = 0.0
-        for sym, sym_pods in self.state.get("pods", {}).items():
-            meta = self.client.products_cache.get(sym)
-            if not meta or not isinstance(sym_pods, dict):
-                continue
-            cval = meta["contract_value"]
-            for p in sym_pods.values():
-                if p:
-                    total += abs(int(p["contracts"])) * cval * float(p["entry_price"]) / self.cfg.leverage
-        return total
-
     def _process_3pod_symbol(self, sym: str, entry_blockers: list, available: Optional[float]) -> bool:
         meta = self.client.products_cache[sym]
-        raw_df = load_delta_candles(sym, resolution=self.cfg.resolution, days=80, base_url=self.cfg.base_url)
+        raw_df = load_delta_candles(sym, resolution=self.cfg.resolution, days=CANDLE_DAYS, base_url=self.cfg.base_url)
         period = pd.Timedelta("1D" if self.cfg.resolution == "1d" else self.cfg.resolution)
-        expected = pd.Timestamp.now(tz="UTC").floor(period) - period
-        history = raw_df.loc[raw_df.index <= expected]
-        if history.empty or history.index[-1] != expected:
-            log.warning("%s: latest closed candle is unavailable", sym)
-            return True
-        valid = np.isfinite(history[["open", "high", "low", "close", "volume"]]).all(axis=1)
-        history = history.loc[valid]
-        if expected not in history.index:
-            raise RuntimeError(f"{sym}: invalid latest closed candle")
-        gaps = history.index.to_series().diff().ne(period)
-        contiguous = history.loc[gaps[gaps].index[-1]:]
-        if len(contiguous) <= 241:
-            log.warning("%s: insufficient continuous candles for 3-pod features (%d <= 241)", sym, len(contiguous))
-            return False
+        try:
+            prepared = prepare_bar(raw_df, pd.Timestamp.now(tz="UTC"), period, self.cfg.donchian_entry_len)
+        except InvalidClosedBar as error:
+            raise RuntimeError(f"{sym}: {error}") from error
+        bar = prepared.bar
+        if bar is None:
+            log.warning("%s: %s", sym, prepared.issue)
+            return prepared.stale
 
-        features = add_3pod_features(contiguous, entry_len=self.cfg.donchian_entry_len, warmup_bars=240)
-        if expected not in features.index or len(features) < 2:
-            log.warning("%s: insufficient 3-pod feature rows", sym)
-            return False
-
-        closed = features.loc[expected]
-        prev_closed = features.iloc[-2]
+        history = prepared.history
         mark_px, best_bid, best_ask = self.client.get_ticker_quotes(sym)
-        atr = float(closed["atr14"])
-        closed_px = float(closed["close"])
-        bar_key = expected.isoformat()
+        bar_key = bar.key
 
         # In paper mode, check intrabar stop-loss & 8h funding on the netted position first.
         pos = self.state["positions"].get(sym)
@@ -1069,9 +1212,9 @@ class LiveDonchianEngine:
             hit = bars_since["low"].le(old_sl) if sign > 0 else bars_since["high"].ge(old_sl)
             if hit.any() or (mark_px - old_sl) * sign <= 0:
                 if hit.any():
-                    bar = bars_since.loc[hit].iloc[0]
-                    trigger = min(old_sl, bar.open) if sign > 0 else max(old_sl, bar.open)
-                    exit_at = bar.name + period
+                    hit_bar = bars_since.loc[hit].iloc[0]
+                    trigger = min(old_sl, hit_bar.open) if sign > 0 else max(old_sl, hit_bar.open)
+                    exit_at = hit_bar.name + period
                 else:
                     trigger, exit_at = mark_px, now
                 exit_px = trigger * (1 - sign * self.cfg.entry_slippage_pct)
@@ -1094,188 +1237,40 @@ class LiveDonchianEngine:
         if self.state["last_entry_bar"].get(sym) == bar_key:
             return False
 
-        sym_pods = self.state.setdefault("pods", {}).setdefault(sym, {})
+        books = self.state.setdefault("pods", {})
+        books.setdefault(sym, {})
         dd_scale = self.cfg.dd_brake_scale if (self.cfg.dd_brake_threshold > 0 and self.state.get("dd_brake_active")) else 1.0
         allocation = min(float(self.state["equity_usd"]), self.cfg.capital_usd)
-        can_open = (not entry_blockers) and (not self.state.get("halt_new_entries")) and (not self._circuit_breaker_tripped())
-        cval = meta["contract_value"]
-        bar_high = float(closed["high"])
-        bar_low = float(closed["low"])
-
-        def free_margin_budget() -> float:
-            return max(self.cfg.max_margin_utilization * allocation - self._pod_margin_used(), 0.0)
-
-        # --- POD 1: Config C Donchian (0.40x) ---
-        dc = sym_pods.get("DONCHIAN")
-        if dc is not None:
-            s_dc = 1 if dc["side"] == "LONG" else -1
-            if (bar_low <= float(dc["sl_price"])) if s_dc > 0 else (bar_high >= float(dc["sl_price"])):
-                sym_pods.pop("DONCHIAN", None)
-                dc = None
-            else:
-                new_sl = closed_px - s_dc * self.cfg.atr_trail_mult * atr
-                if (new_sl - float(dc["sl_price"])) * s_dc > 0:
-                    dc["sl_price"] = new_sl
-                # Pyramid check (+1.5R and SL >= breakeven)
-                if can_open and self.cfg.pyramid_add_fraction > 0 and not dc.get("pyramided"):
-                    be_ok = (float(dc["sl_price"]) - float(dc["init_entry"])) * s_dc >= 0
-                    move = (mark_px - float(dc["init_entry"])) * s_dc
-                    if be_ok and move >= self.cfg.pyramid_trigger_r * float(dc["init_sl_dist"]):
-                        add_c = min(
-                            math.floor(int(dc["contracts"]) * self.cfg.pyramid_add_fraction),
-                            math.floor(free_margin_budget() * self.cfg.leverage / (mark_px * cval)),
-                        )
-                        if add_c >= 1:
-                            dc["contracts"] = int(dc["contracts"]) + add_c
-                            dc["pyramided"] = True
-        elif can_open and self.cfg.pod_weight_donchian > 0 and atr > 0:
-            dc_side = None
-            if closed["ema50"] > closed["ema200"] and closed_px > float(closed["donchian_high"]):
-                dc_side = "LONG"
-            elif closed["ema50"] < closed["ema200"] and closed_px < float(closed["donchian_low"]):
-                dc_side = "SHORT"
-            if dc_side is not None:
-                dc_risk = self.cfg.risk_per_trade_pct * self.cfg.pod_weight_donchian * dd_scale
-                sl_dist = self.cfg.atr_trail_mult * atr
-                c_qty = math.floor(min(
-                    allocation * dc_risk / (sl_dist * cval),
-                    free_margin_budget() * self.cfg.leverage / (mark_px * cval),
-                ))
-                if c_qty >= 1:
-                    s_dc = 1 if dc_side == "LONG" else -1
-                    sym_pods["DONCHIAN"] = {
-                        "side": dc_side, "contracts": c_qty, "entry_price": mark_px,
-                        "init_entry": mark_px, "init_sl_dist": sl_dist,
-                        "sl_price": mark_px - s_dc * sl_dist, "pyramided": False,
-                    }
-
-        # --- POD 2: Supertrend(10,3) + ADX(14)>20 (0.35x) ---
-        st = sym_pods.get("SUPERTREND")
-        st_dir = int(closed["st_dir"])
-        prev_st_dir = int(prev_closed["st_dir"])
-        if st is not None:
-            s_st = 1 if st["side"] == "LONG" else -1
-            flipped = (s_st > 0 and st_dir == -1) or (s_st < 0 and st_dir == 1)
-            sl_hit = (bar_low <= float(st["sl_price"])) if s_st > 0 else (bar_high >= float(st["sl_price"]))
-            if flipped or sl_hit:
-                sym_pods.pop("SUPERTREND", None)
-                st = None
-            else:
-                new_sl = closed_px - s_st * 3.5 * atr
-                if (new_sl - float(st["sl_price"])) * s_st > 0:
-                    st["sl_price"] = new_sl
-        elif can_open and self.cfg.pod_weight_supertrend > 0 and atr > 0:
-            st_side = None
-            if st_dir == 1 and prev_st_dir == -1 and float(closed["adx14"]) >= 20.0:
-                st_side = "LONG"
-            elif st_dir == -1 and prev_st_dir == 1 and float(closed["adx14"]) >= 20.0:
-                st_side = "SHORT"
-            if st_side is not None:
-                st_risk = self.cfg.risk_per_trade_pct * self.cfg.pod_weight_supertrend * dd_scale
-                sl_dist = 3.5 * atr
-                c_qty = math.floor(min(
-                    allocation * st_risk / (sl_dist * cval),
-                    free_margin_budget() * self.cfg.leverage / (mark_px * cval),
-                ))
-                if c_qty >= 1:
-                    s_st = 1 if st_side == "LONG" else -1
-                    sym_pods["SUPERTREND"] = {
-                        "side": st_side, "contracts": c_qty, "entry_price": mark_px,
-                        "sl_price": mark_px - s_st * sl_dist,
-                    }
-
-        # --- POD 3: CTA TSMOM Vol-Target (0.35x, 48h boundary) ---
-        bar_slot = int(expected.timestamp() // int(period.total_seconds()))
-        if self.cfg.pod_weight_tsmom > 0 and (bar_slot % self.cfg.tsmom_rebalance_bars == 0):
-            vol28 = float(closed["vol28"])
-            sig = (np.sign(float(closed["ret_7d"])) + np.sign(float(closed["ret_21d"])) + np.sign(float(closed["ret_60d"]))) / 3.0
-            if vol28 <= 0.05 or abs(sig) < 0.34 or not can_open:
-                sym_pods.pop("TSMOM", None)
-            else:
-                ts_side = "LONG" if sig > 0 else "SHORT"
-                cur_ts = sym_pods.get("TSMOM")
-                if cur_ts is not None and cur_ts["side"] != ts_side:
-                    sym_pods.pop("TSMOM", None)
-                    cur_ts = None
-                if cur_ts is None:
-                    t_vol = self.cfg.tsmom_target_vol * self.cfg.pod_weight_tsmom * dd_scale
-                    weight = min((t_vol / vol28) * abs(sig) / max(len(self.cfg.symbols), 1), 0.40 * self.cfg.pod_weight_tsmom)
-                    notional = min(allocation * weight, free_margin_budget() * self.cfg.leverage)
-                    c_qty = math.floor(notional / (mark_px * cval))
-                    if c_qty >= 1:
-                        sym_pods["TSMOM"] = {
-                            "side": ts_side, "contracts": c_qty, "entry_price": mark_px,
-                            "sl_price": None,
-                        }
-
-        # --- POD 4: Funding + Volume Squeeze Composite (0.35x) ---
-        sq = sym_pods.get("SQUEEZE")
-        if sq is not None:
-            s_sq = 1 if sq["side"] == "LONG" else -1
-            if (bar_low <= float(sq["sl_price"])) if s_sq > 0 else (bar_high >= float(sq["sl_price"])):
-                sym_pods.pop("SQUEEZE", None)
-                sq = None
-            else:
-                new_sl = closed_px - s_sq * self.cfg.squeeze_atr_trail_mult * atr
-                if (new_sl - float(sq["sl_price"])) * s_sq > 0:
-                    sq["sl_price"] = new_sl
-        elif can_open and self.cfg.pod_weight_squeeze > 0 and atr > 0:
-            vol_ma = float(closed["vol_ma20"])
-            vol_surge = vol_ma > 0 and float(closed["volume"]) > self.cfg.squeeze_vol_mult * vol_ma
-            if vol_surge and (closed_px > float(closed["donchian_high"]) or closed_px < float(closed["donchian_low"])):
-                fr_3d = load_delta_funding_avg(sym, days=4, base_url=DELTA_INDIA_BASE)
-                sq_side = None
-                if fr_3d is not None:
-                    if closed_px > float(closed["donchian_high"]) and fr_3d <= self.cfg.squeeze_long_max_funding:
-                        sq_side = "LONG"
-                    elif closed_px < float(closed["donchian_low"]) and fr_3d >= self.cfg.squeeze_short_min_funding:
-                        sq_side = "SHORT"
-                if sq_side is not None:
-                    sq_risk = self.cfg.risk_per_trade_pct * self.cfg.pod_weight_squeeze * dd_scale
-                    sl_dist = self.cfg.squeeze_atr_trail_mult * atr
-                    c_qty = math.floor(min(
-                        allocation * sq_risk / (sl_dist * cval),
-                        free_margin_budget() * self.cfg.leverage / (mark_px * cval),
-                    ))
-                    if c_qty >= 1:
-                        s_sq = 1 if sq_side == "LONG" else -1
-                        sym_pods["SQUEEZE"] = {
-                            "side": sq_side, "contracts": c_qty, "entry_price": mark_px,
-                            "sl_price": mark_px - s_sq * sl_dist,
-                        }
-
-        # Compute signed net target contracts and tightest aligned protective stop.
-        net_signed = 0
-        for p in sym_pods.values():
-            if p:
-                net_signed += int(p["contracts"]) * (1 if p["side"] == "LONG" else -1)
-
-        net_sl_str = None
-        if net_signed != 0:
-            net_sign = 1 if net_signed > 0 else -1
-            aligned_stops = [
-                float(p["sl_price"]) for p in sym_pods.values()
-                if p and p.get("sl_price") is not None and (1 if p["side"] == "LONG" else -1) == net_sign
-            ]
-            if aligned_stops:
-                raw_sl = max(aligned_stops) if net_sign > 0 else min(aligned_stops)
-            else:
-                raw_sl = mark_px - net_sign * self.cfg.catastrophe_stop_atr_mult * atr
-            # Ensure stop is strictly on the protective side of mark_px
-            if (mark_px - raw_sl) * net_sign <= 0:
-                raw_sl = mark_px - net_sign * self.cfg.atr_trail_mult * atr
-            net_sl_str = self._stop_price(raw_sl, meta["tick_size"], net_sign)
-
-        self._sync_net_position(sym, meta, net_signed, net_sl_str, mark_px, best_bid, best_ask, expected, period)
+        can_open = not self._entries_blocked(entry_blockers)
+        market = Market(mark_px, meta["contract_value"], meta["tick_size"])
+        context = DecisionContext(allocation, dd_scale, can_open, len(self.cfg.symbols))
+        rules = DecisionRules.from_live_config(self.cfg)
+        configured = set(self.cfg.symbols)
+        contract_values = {s: m["contract_value"] for s, m in self.client.products_cache.items() if m and s in configured}
+        decision_args = (sym, bar, market, context, rules, books, contract_values)
+        intent = decide_four_pod(*decision_args)
+        if intent is FundingRequest.NEEDED:
+            funding = load_delta_funding_avg(sym, days=4, base_url=DELTA_INDIA_BASE)
+            intent = decide_four_pod(*decision_args, funding=funding)
+        assert isinstance(intent, NetIntent)
+        # Install both before sync: its first durable intent includes the book and the consumed candle.
+        books[sym] = intent.book
         self.state["last_entry_bar"][sym] = bar_key
+        self._sync_net_position(sym, meta, intent.target, intent.stop, mark_px, best_bid, best_ask, bar.open_at, period,
+                                entry_blockers=entry_blockers)
         self._save_state()
         return False
 
     def _sync_net_position(
         self, sym: str, meta: dict, target_signed: int, target_sl: Optional[str],
         mark_px: float, best_bid: float, best_ask: float, expected: pd.Timestamp, period: pd.Timedelta,
+        *, entry_blockers=(),
     ) -> None:
         pos = self.state["positions"].get(sym)
+        if pos is not None and "pending_net" in pos:
+            raise RuntimeError(f"{sym}: reconcile pending net IOC before submitting another order")
+        if pos is not None and "pending_trail" in pos:
+            raise RuntimeError(f"{sym}: reconcile pending trail before submitting another order")
         cur_signed = 0 if pos is None else int(pos["contracts"]) * (1 if pos["side"] == "LONG" else -1)
         next_bar_at = (expected + period).isoformat()
         cval = meta["contract_value"]
@@ -1288,10 +1283,12 @@ class LiveDonchianEngine:
                 if (float(target_sl) - old_sl) * sign > 0 and (mark_px - float(target_sl)) * sign > 0:
                     if self.cfg.dry_run:
                         pos["sl_price"] = target_sl
+                        log.info("3POD TRAIL SL %s %s | %s -> %s", sym, pos["side"], old_sl, target_sl)
                     else:
-                        self.client.edit_stop(meta["id"], pos["sl_order_id"], pos["contracts"], target_sl)
+                        # Persist intent with the consumed candle, without changing the verified stop snapshot.
+                        pos["pending_trail"] = {"stop_price": target_sl}
+                        self._save_state()
                         self._reconcile(sym, meta)
-                    log.info("3POD TRAIL SL %s %s | %s -> %s", sym, pos["side"], old_sl, target_sl)
             return
 
         # Paper mode net-position sync
@@ -1304,6 +1301,9 @@ class LiveDonchianEngine:
                 pos = None
                 cur_signed = 0
             if target_signed == 0:
+                return
+            # Check actual net increases, including reopening after a flip realizes a loss.
+            if abs(target_signed) > abs(cur_signed) and self._entries_blocked(entry_blockers):
                 return
             if pos is None:
                 side = "LONG" if target_signed > 0 else "SHORT"
@@ -1328,74 +1328,64 @@ class LiveDonchianEngine:
                 else:
                     reduce_qty = abs(delta)
                     exit_px = mark_px * (1 - sign * slip)
-                    pnl = (exit_px - pos["entry_price"]) * sign * reduce_qty * cval - exit_px * reduce_qty * cval * meta["fee_rate"]
-                    self.state["equity_usd"] += pnl
+                    exit_fee = exit_px * reduce_qty * cval * meta["fee_rate"]
+                    self._account_partial_exit(pos, reduce_qty, exit_px, exit_fee, datetime.now(timezone.utc))
                     pos["contracts"] = abs(target_signed)
                 pos["sl_price"] = target_sl
                 log.info("3POD NET RESIZE %s %s -> x%d | SL=%s (DRY_RUN=True)", sym, pos["side"], pos["contracts"], target_sl)
             return
 
-        # Live testnet execution: keep exchange position & single protective stop strictly reconciled.
         pid = meta["id"]
         if pos is not None and (target_signed == 0 or cur_signed * target_signed < 0):
-            if "sl_order_id" in pos:
-                self.client.cancel_order(pid, pos["sl_order_id"])
-            close_side = "sell" if cur_signed > 0 else "buy"
-            sign = 1 if cur_signed > 0 else -1
-            close_limit = self._stop_price(mark_px * (1 - sign * slip), meta["tick_size"], sign)
-            cid = uuid4().hex
-            res = self.client.submit_net_order(pid, close_side, pos["contracts"], close_limit, cid, reduce_only=True)
-            filled = int(res.get("size", 0)) - int(res.get("unfilled_size", 0))
-            if filled != pos["contracts"]:
-                self._emergency_close(sym, pid, pos, cur_signed, "incomplete 3-pod net close")
-            exit_px = float(res["average_fill_price"])
-            exit_fee = float(res["paid_commission"])
-            self._record_exit(sym, pos, exit_px, pos.get("entry_fee", 0.0) + exit_fee, datetime.now(timezone.utc))
-            pos = None
-            cur_signed = 0
-            if target_signed == 0:
+            self._submit_net_reduction(sym, meta, pos, -cur_signed, mark_px, pos["sl_price"])
+            # A partial/zero close keeps the residual stop. Recovery never opens the other side.
+            if target_signed == 0 or sym in self.state["positions"]:
                 return
+            pos, cur_signed = None, 0
 
-        if pos is None:
-            side = "LONG" if target_signed > 0 else "SHORT"
-            sign = 1 if target_signed > 0 else -1
+        sign = 1 if target_signed > 0 else -1
+        increasing = abs(target_signed) > abs(cur_signed)
+        stop_px = float(target_sl) if target_sl is not None else 0.0
+        valid_stop = math.isfinite(stop_px) and stop_px > 0 and (mark_px - stop_px) * sign > 0
+        if increasing:
+            if pos is not None:
+                # An IOC followed by a stop edit cannot guarantee coverage of the add.
+                log.warning("%s: deferring net increase %s -> %s until protected adds are verified",
+                            sym, cur_signed, target_signed)
+                return
+            # A surviving virtual pod target can increase actual exchange exposure even when the
+            # decision context disallows new pods (partial fills, changed offsets, or a reversal).
+            if self._entries_blocked(entry_blockers) or not valid_stop:
+                return
             self.client.check_entry_settings(pid)
+            if self._entries_blocked(entry_blockers):
+                return
+        if pos is None:
             entry_limit = self._stop_price(mark_px * (1 + sign * slip), meta["tick_size"], -sign)
-            cid = uuid4().hex
             new_pos = self.state["positions"][sym] = {
-                "side": side, "contracts": abs(target_signed), "contract_value": cval,
+                "side": "LONG" if sign > 0 else "SHORT", "contracts": abs(target_signed), "contract_value": cval,
                 "entry_price": mark_px, "entry_limit": entry_limit, "entry_mode": "ioc",
-                "entry_fee": 0.0, "sl_price": target_sl, "risk_pct": 0.02, "client_order_id": cid,
+                "entry_fee": 0.0, "sl_price": target_sl, "risk_pct": 0.02, "client_order_id": uuid4().hex,
             }
             self._save_state()
             self.client.submit_entry(pid, new_pos)
             self._reconcile(sym, meta)
             return
 
-        # Same-direction resize: adjust contracts and immediately update the single protective stop.
-        diff = target_signed - cur_signed
-        order_side = "buy" if diff > 0 else "sell"
+        self._submit_net_reduction(sym, meta, pos, target_signed - cur_signed, mark_px,
+                                   target_sl if valid_stop else pos["sl_price"])
+
+    def _submit_net_reduction(self, sym, meta, pos, diff, mark_px, stop_price):
+        # Keep the original position/stop snapshot until the broker confirms the IOC and protection.
         order_sign = 1 if diff > 0 else -1
-        limit_px = self._stop_price(mark_px * (1 + order_sign * slip), meta["tick_size"], -order_sign)
-        is_reduce = abs(target_signed) < abs(cur_signed)
+        limit_px = self._stop_price(mark_px * (1 + order_sign * self.cfg.entry_slippage_pct), meta["tick_size"], -order_sign)
         cid = uuid4().hex
-        res = self.client.submit_net_order(pid, order_side, abs(diff), limit_px, cid, reduce_only=is_reduce)
-        filled = int(res.get("size", 0)) - int(res.get("unfilled_size", 0))
-        if filled > 0:
-            fill_px = float(res["average_fill_price"])
-            fill_fee = float(res["paid_commission"])
-            if is_reduce:
-                sign = 1 if cur_signed > 0 else -1
-                pnl = (fill_px - pos["entry_price"]) * sign * filled * cval - fill_fee
-                self.state["equity_usd"] += pnl
-                pos["contracts"] -= filled
-            else:
-                new_total = pos["contracts"] + filled
-                pos["entry_price"] = (pos["entry_price"] * pos["contracts"] + fill_px * filled) / new_total
-                pos["contracts"] = new_total
-                pos["entry_fee"] = pos.get("entry_fee", 0.0) + fill_fee
-            self.client.edit_stop(pid, pos["sl_order_id"], pos["contracts"], target_sl or pos["sl_price"])
-            self._reconcile(sym, meta)
+        pos["pending_net"] = {"client_order_id": cid, "signed_delta": diff, "limit_price": limit_px,
+                              "stop_price": stop_price, "stop_edit_attempted": False}
+        self._save_state()
+        self.client.submit_net_order(meta["id"], "buy" if diff > 0 else "sell", abs(diff), limit_px, cid,
+                                     reduce_only=True)
+        self._reconcile(sym, meta)
 
 
 def seconds_until_next_bar_close(resolution: str = "4h", now: Optional[datetime] = None) -> float:
@@ -1420,7 +1410,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
     parser.add_argument("--resume", action="store_true", help="Verify flat reconciled account and clear halt_new_entries")
     parser.add_argument("--setup-account", action="store_true", help="Configure isolated margin, disable auto top-up/DETO, and set 5x leverage on all symbols (testnet only)")
-    parser.add_argument("--strategy", choices=["config_c", "3pod"], default=None, help="Override DELTA_STRATEGY_MODE (3pod balanced or legacy config_c)")
+    parser.add_argument("--strategy", choices=["four_pod_balanced", "config_c", "3pod"], default=None, help="Select Four-Pod Balanced or legacy Config C (3pod is a compatibility alias)")
     args = parser.parse_args()
     cfg = DeltaLiveConfig(**({} if args.strategy is None else {"strategy_mode": args.strategy}))
     if not cfg.dry_run and (not cfg.api_key or not cfg.api_secret):

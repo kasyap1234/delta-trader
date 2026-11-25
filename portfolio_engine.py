@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
-from config import PortfolioConfig
+if TYPE_CHECKING:
+    from config import PortfolioConfig
 
 
 @dataclass
